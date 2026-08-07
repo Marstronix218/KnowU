@@ -2,11 +2,11 @@ use std::{
     collections::HashMap,
     fs,
     io::{Read, Write},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     process::Command,
     sync::{Arc, RwLock},
     thread,
-    time::Duration,
+    time::{Duration, UNIX_EPOCH},
 };
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
@@ -24,6 +24,10 @@ use crate::{
 };
 
 const MAX_HISTORICAL_VISIT_SECONDS: i64 = 12 * 60 * 60;
+const CONTINUOUS_HISTORY_LOOKBACK_DAYS: i64 = 2;
+const EDITOR_HISTORY_LOOKBACK_DAYS: i64 = 7;
+const LOCAL_CONTEXT_POLL_SECONDS: u64 = 30;
+const MAX_EDITOR_EVENTS_PER_SCAN: usize = 500;
 
 #[derive(Default)]
 pub struct RuntimeStatus {
@@ -186,6 +190,315 @@ fn import_chrome_history(
         (Ok(_), Err(error)) => Err(AppError::Io(error)),
         (Ok(count), Ok(())) => Ok(count),
     }
+}
+
+/// Keeps the local timeline fresh without requiring the Chrome extension or an
+/// editor-specific extension. Chrome is backfilled from its selected local
+/// History databases, while supported editors contribute metadata from their
+/// own Local History indexes. File contents and Local History snapshots are
+/// never opened.
+pub fn start_local_metadata_collectors(db: Arc<Database>) {
+    start_continuous_chrome_history(db.clone());
+    start_editor_history_collector(db);
+}
+
+fn start_continuous_chrome_history(db: Arc<Database>) {
+    thread::spawn(move || {
+        let mut previous_signature = Vec::new();
+        loop {
+            let collection_enabled = db
+                .settings()
+                .map(|settings| settings.collection_enabled)
+                .unwrap_or(false);
+            if collection_enabled {
+                if let Ok(signature) = selected_history_signature(&db) {
+                    if !signature.is_empty() && signature != previous_signature {
+                        match import_selected_chrome_history(&db, CONTINUOUS_HISTORY_LOOKBACK_DAYS)
+                        {
+                            Ok(_) => previous_signature = signature,
+                            Err(error) => {
+                                eprintln!("continuous Chrome history backfill failed: {error}")
+                            }
+                        }
+                    }
+                }
+            }
+            thread::sleep(Duration::from_secs(LOCAL_CONTEXT_POLL_SECONDS));
+        }
+    });
+}
+
+fn selected_history_signature(db: &Database) -> AppResult<Vec<(PathBuf, u64, u128)>> {
+    let mut signature = Vec::new();
+    for profile_path in db.selected_profile_paths()?.into_values() {
+        let history = profile_path.join("History");
+        let Ok(metadata) = fs::metadata(&history) else {
+            continue;
+        };
+        let modified = metadata
+            .modified()
+            .ok()
+            .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+            .map(|value| value.as_nanos())
+            .unwrap_or_default();
+        signature.push((history, metadata.len(), modified));
+    }
+    signature.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(signature)
+}
+
+fn start_editor_history_collector(db: Arc<Database>) {
+    thread::spawn(move || {
+        let mut observed_indexes = HashMap::new();
+        loop {
+            let settings = db.settings().unwrap_or_default();
+            if settings.collection_enabled {
+                if let Err(error) =
+                    import_editor_history(&db, &settings.excluded_apps, &mut observed_indexes)
+                {
+                    eprintln!("local editor activity import failed: {error}");
+                }
+            }
+            thread::sleep(Duration::from_secs(LOCAL_CONTEXT_POLL_SECONDS));
+        }
+    });
+}
+
+#[derive(Debug, Clone)]
+struct EditorInstallation {
+    app_name: &'static str,
+    user_data: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+struct EditorWorkspace {
+    name: String,
+    path: PathBuf,
+}
+
+#[derive(serde::Deserialize)]
+struct EditorWorkspaceIndex {
+    folder: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct EditorHistoryIndex {
+    resource: String,
+    #[serde(default)]
+    entries: Vec<EditorHistoryEntry>,
+}
+
+#[derive(serde::Deserialize)]
+struct EditorHistoryEntry {
+    timestamp: i64,
+}
+
+type FileSignature = (u64, u128);
+
+fn editor_installations() -> Vec<EditorInstallation> {
+    let Some(application_support) =
+        dirs::home_dir().map(|home| home.join("Library/Application Support"))
+    else {
+        return Vec::new();
+    };
+    [
+        ("Visual Studio Code", "Code"),
+        ("Cursor", "Cursor"),
+        ("Cortex Code", "Cortex Code"),
+    ]
+    .into_iter()
+    .map(|(app_name, directory)| EditorInstallation {
+        app_name,
+        user_data: application_support.join(directory).join("User"),
+    })
+    .filter(|installation| installation.user_data.is_dir())
+    .collect()
+}
+
+fn import_editor_history(
+    db: &Database,
+    excluded_apps: &[String],
+    observed_indexes: &mut HashMap<PathBuf, FileSignature>,
+) -> AppResult<usize> {
+    let cutoff_ms = (Utc::now().timestamp() - EDITOR_HISTORY_LOOKBACK_DAYS * 86_400) * 1_000;
+    let mut candidates = Vec::new();
+
+    for installation in editor_installations() {
+        if editor_is_excluded(excluded_apps, installation.app_name) {
+            continue;
+        }
+        let workspaces = discover_editor_workspaces(&installation.user_data);
+        if workspaces.is_empty() {
+            continue;
+        }
+        let history_root = installation.user_data.join("History");
+        let Ok(history_directories) = fs::read_dir(history_root) else {
+            continue;
+        };
+        for directory in history_directories.flatten() {
+            let index_path = directory.path().join("entries.json");
+            let Some(signature) = file_signature(&index_path) else {
+                continue;
+            };
+            if observed_indexes.get(&index_path) == Some(&signature) {
+                continue;
+            }
+            if let Ok(events) =
+                parse_editor_history(&index_path, installation.app_name, &workspaces, cutoff_ms)
+            {
+                candidates.extend(events);
+            }
+            observed_indexes.insert(index_path, signature);
+        }
+    }
+
+    candidates.sort_by_key(|event| std::cmp::Reverse(event.occurred_at));
+    candidates.truncate(MAX_EDITOR_EVENTS_PER_SCAN);
+    let mut imported = 0;
+    for event in candidates {
+        if db.insert_event(&event, &fingerprint(&event))? {
+            imported += 1;
+        }
+    }
+    Ok(imported)
+}
+
+fn editor_is_excluded(excluded_apps: &[String], app_name: &str) -> bool {
+    excluded_apps.iter().any(|value| {
+        value.eq_ignore_ascii_case(app_name)
+            || (app_name == "Visual Studio Code" && value.eq_ignore_ascii_case("Code"))
+    })
+}
+
+fn discover_editor_workspaces(user_data: &Path) -> Vec<EditorWorkspace> {
+    let workspace_storage = user_data.join("workspaceStorage");
+    let Ok(entries) = fs::read_dir(workspace_storage) else {
+        return Vec::new();
+    };
+    let mut workspaces = entries
+        .flatten()
+        .filter_map(|entry| fs::read(entry.path().join("workspace.json")).ok())
+        .filter_map(|bytes| serde_json::from_slice::<EditorWorkspaceIndex>(&bytes).ok())
+        .filter_map(|index| index.folder)
+        .filter_map(|value| Url::parse(&value).ok())
+        .filter_map(|url| url.to_file_path().ok())
+        .filter(|path| path.is_dir())
+        .filter_map(|path| {
+            let name = path.file_name()?.to_string_lossy().trim().to_string();
+            (!name.is_empty()).then_some(EditorWorkspace { name, path })
+        })
+        .collect::<Vec<_>>();
+    workspaces.sort_by(|left, right| {
+        right
+            .path
+            .as_os_str()
+            .len()
+            .cmp(&left.path.as_os_str().len())
+    });
+    workspaces.dedup_by(|left, right| left.path == right.path);
+    workspaces
+}
+
+fn parse_editor_history(
+    index_path: &Path,
+    app_name: &str,
+    workspaces: &[EditorWorkspace],
+    cutoff_ms: i64,
+) -> AppResult<Vec<ActivityEvent>> {
+    let index: EditorHistoryIndex = serde_json::from_slice(&fs::read(index_path)?)?;
+    let resource = Url::parse(&index.resource)
+        .ok()
+        .and_then(|url| url.to_file_path().ok())
+        .ok_or_else(|| {
+            AppError::InvalidInput("Editor history resource is not a local file.".into())
+        })?;
+    let workspace = workspaces
+        .iter()
+        .find(|workspace| resource.starts_with(&workspace.path))
+        .ok_or_else(|| {
+            AppError::InvalidInput("Editor history is outside a known workspace.".into())
+        })?;
+    let relative = resource
+        .strip_prefix(&workspace.path)
+        .ok()
+        .and_then(safe_editor_relative_path)
+        .ok_or_else(|| AppError::InvalidInput("Editor history path is excluded.".into()))?;
+    let title = format!("{} — {relative}", workspace.name);
+    let now_ms = Utc::now().timestamp_millis();
+
+    Ok(index
+        .entries
+        .into_iter()
+        .filter(|entry| entry.timestamp >= cutoff_ms && entry.timestamp <= now_ms + 300_000)
+        .map(|entry| ActivityEvent {
+            id: None,
+            occurred_at: entry.timestamp / 1_000,
+            ended_at: None,
+            duration_seconds: 0,
+            app_name: app_name.into(),
+            window_title: Some(title.clone()),
+            url: None,
+            page_title: Some(relative.clone()),
+            search_query: None,
+            browser_profile_id: None,
+            source: ActivitySource::EditorHistory,
+            is_bootstrap: false,
+        })
+        .collect())
+}
+
+fn safe_editor_relative_path(path: &Path) -> Option<String> {
+    let blocked_directories = ["node_modules", "target", "dist", "build", "vendor"];
+    let mut parts = Vec::new();
+    for component in path.components() {
+        let Component::Normal(value) = component else {
+            return None;
+        };
+        let value = value.to_string_lossy();
+        if value.starts_with('.')
+            || blocked_directories
+                .iter()
+                .any(|blocked| value.eq_ignore_ascii_case(blocked))
+        {
+            return None;
+        }
+        parts.push(value.into_owned());
+    }
+    let file_name = parts.last()?.to_ascii_lowercase();
+    let file_path = Path::new(&file_name);
+    let extension = file_path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    let stem = file_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    let allowed_extensions = [
+        "c", "cc", "cpp", "css", "go", "h", "hpp", "html", "java", "js", "json", "jsx", "kt",
+        "kts", "md", "py", "rb", "rs", "sh", "sql", "swift", "toml", "ts", "tsx", "vue", "yaml",
+        "yml",
+    ];
+    let blocked_names = ["credentials", "secrets", "id_rsa", "id_ed25519"];
+    if !allowed_extensions.contains(&extension)
+        || blocked_names.contains(&stem)
+        || matches!(extension, "key" | "pem" | "p12" | "pfx")
+    {
+        return None;
+    }
+    let value = parts.join("/");
+    Some(value.chars().take(180).collect())
+}
+
+fn file_signature(path: &Path) -> Option<FileSignature> {
+    let metadata = fs::metadata(path).ok()?;
+    let modified = metadata
+        .modified()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    Some((metadata.len(), modified))
 }
 
 pub fn start_collector(db: Arc<Database>, runtime: Arc<RwLock<RuntimeStatus>>) {
@@ -822,6 +1135,63 @@ mod tests {
         assert_eq!(first, fingerprint(&event));
         event.window_title = Some("Different document".into());
         assert_ne!(first, fingerprint(&event));
+    }
+
+    #[test]
+    fn editor_history_imports_only_local_metadata() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace_path = directory.path().join("KnowU");
+        fs::create_dir_all(workspace_path.join("src")).unwrap();
+        let resource = Url::from_file_path(workspace_path.join("src/platform.rs"))
+            .unwrap()
+            .to_string();
+        let index_path = directory.path().join("entries.json");
+        let timestamp = Utc::now().timestamp_millis();
+        fs::write(
+            &index_path,
+            serde_json::json!({
+                "version":1,
+                "resource":resource,
+                "entries":[{"id":"snapshot-id","timestamp":timestamp,"source":"File Saved"}]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let workspaces = vec![EditorWorkspace {
+            name: "KnowU".into(),
+            path: workspace_path,
+        }];
+
+        let events = parse_editor_history(
+            &index_path,
+            "Visual Studio Code",
+            &workspaces,
+            timestamp - 1_000,
+        )
+        .unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].source, ActivitySource::EditorHistory);
+        assert_eq!(events[0].page_title.as_deref(), Some("src/platform.rs"));
+        assert_eq!(
+            events[0].window_title.as_deref(),
+            Some("KnowU — src/platform.rs")
+        );
+        assert_eq!(events[0].duration_seconds, 0);
+        assert!(events[0].url.is_none());
+        assert!(events[0].search_query.is_none());
+    }
+
+    #[test]
+    fn editor_history_excludes_secrets_hidden_files_and_generated_trees() {
+        assert!(safe_editor_relative_path(Path::new("src/main.rs")).is_some());
+        assert!(safe_editor_relative_path(Path::new(".env")).is_none());
+        assert!(safe_editor_relative_path(Path::new(".github/workflows/ci.yml")).is_none());
+        assert!(safe_editor_relative_path(Path::new("node_modules/pkg/index.js")).is_none());
+        assert!(safe_editor_relative_path(Path::new("target/debug/build.rs")).is_none());
+        assert!(safe_editor_relative_path(Path::new("certificates/client.pem")).is_none());
+        assert!(safe_editor_relative_path(Path::new("config/credentials.json")).is_none());
+        assert!(safe_editor_relative_path(Path::new("config/secrets.toml")).is_none());
     }
 
     #[test]

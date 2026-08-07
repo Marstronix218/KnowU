@@ -3,7 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
 import { api } from "./lib/api";
 import { mockBrowsers, mockDashboard, mockProfile, mockSettings } from "./lib/mockData";
-import type { ChatMessage, ChatRunResult, ProfileData } from "./types";
+import type { ActivityEvent, ChatMessage, ChatRunResult, ProfileData } from "./types";
 
 function clone<T>(value: T): T {
   return structuredClone(value);
@@ -36,7 +36,7 @@ function chatRun(message: ChatMessage): ChatRunResult {
       measurementMethod: "provider_usage_scaled_estimate",
       telemetryStatus: "synced-to-snowflake",
       baselineContextPreview: "Full approved profile context",
-      optimizedContextPreview: "Privacy is more important than feature count.",
+      optimizedContextPreview: "Privacy is more important than feature count.\nQUERY-SPECIFIC LOCAL ACTIVITY FACTS\nSnowflake: matched events=220",
     },
     integration: {
       memoryProvider: "everos",
@@ -49,6 +49,7 @@ function stubApi() {
   sessionStorage.clear();
   localStorage.removeItem("knowu.selected-thread");
   vi.spyOn(api, "settings").mockResolvedValue(clone(mockSettings));
+  vi.spyOn(api, "openResource").mockResolvedValue(undefined);
   vi.spyOn(api, "dashboard").mockResolvedValue(clone(mockDashboard));
   vi.spyOn(api, "activity").mockResolvedValue(clone(mockDashboard.recentActivity));
   vi.spyOn(api, "profile").mockResolvedValue(clone(mockProfile));
@@ -75,6 +76,33 @@ async function renderRoute(hash: string) {
   window.location.hash = hash;
   render(<App />);
   await screen.findByText("KnowU");
+}
+
+function dashboardWithPreviewEvents(events: ActivityEvent[]) {
+  vi.mocked(api.dashboard).mockResolvedValue({
+    ...clone(mockDashboard),
+    activeTopics: [{ name: "Classical music", count: events.length }],
+    recentActivity: events,
+    recommendations: [],
+  });
+}
+
+function previewEvent(
+  id: string,
+  startedAt: string,
+  url?: string,
+  pageTitle = "Classical music",
+): ActivityEvent {
+  return {
+    id,
+    appName: url ? "Google Chrome" : "Music",
+    pageTitle,
+    url,
+    startedAt,
+    durationSeconds: 300,
+    topic: "Classical music",
+    source: url ? "history" : "collector",
+  };
 }
 
 describe("application navigation", () => {
@@ -141,6 +169,26 @@ describe("dashboard", () => {
     expect(screen.getByRole("button", { name: /Resume thread/ })).toBeInTheDocument();
   });
 
+  it("opens the latest web resource through the desktop API before reporting success", async () => {
+    await renderRoute("#/dashboard");
+
+    fireEvent.click(await screen.findByRole("button", { name: /Resume thread/ }));
+
+    await waitFor(() => {
+      expect(api.openResource).toHaveBeenCalledWith("https://v2.tauri.app/security/capabilities/");
+      expect(screen.getByRole("status")).toHaveTextContent("Opened the latest available resource.");
+    });
+  });
+
+  it("reports when the latest web resource cannot be opened", async () => {
+    vi.mocked(api.openResource).mockRejectedValueOnce(new Error("open failed"));
+    await renderRoute("#/dashboard");
+
+    fireEvent.click(await screen.findByRole("button", { name: /Resume thread/ }));
+
+    expect(await screen.findByText("Could not open the latest available resource.")).toBeInTheDocument();
+  });
+
   it("lists reconstructed work threads and their evidence boundary", async () => {
     await renderRoute("#/dashboard");
 
@@ -149,6 +197,30 @@ describe("dashboard", () => {
     expect(screen.getByText("Desktop development")).toBeInTheDocument();
     expect(screen.getByText("Why this thread?")).toBeInTheDocument();
     expect(screen.getByText("Detailed activity stays local")).toBeInTheDocument();
+  });
+
+  it("shows cross-app Snowflake activity as one subject thread", async () => {
+    const startedAt = new Date().toISOString();
+    const snowflakeActivity: ActivityEvent[] = [
+      { id: "snow-1", appName: "Google Chrome", pageTitle: "Snowflake tutorial — YouTube", url: "https://youtube.com/watch?v=snow", startedAt, durationSeconds: 600, topic: "Snowflake", source: "history" },
+      { id: "snow-2", appName: "Google Chrome", pageTitle: "snowflake architecture — Google Search", searchQuery: "snowflake architecture", url: "https://google.com/search?q=snowflake", startedAt, durationSeconds: 0, topic: "Snowflake", source: "history" },
+      { id: "snow-3", appName: "Google Chrome", pageTitle: "Snowsight", url: "https://app.snowflake.com/example", startedAt, durationSeconds: 300, topic: "Snowflake", source: "chrome" },
+      { id: "snow-4", appName: "Preview", pageTitle: "Snowflake migration notes.pdf", startedAt, durationSeconds: 180, topic: "Snowflake", source: "collector" },
+      { id: "snow-5", appName: "Cursor", pageTitle: "src/snowflake_client.rs", startedAt, durationSeconds: 0, topic: "Snowflake", source: "editor" },
+    ];
+    vi.mocked(api.dashboard).mockResolvedValue({
+      ...clone(mockDashboard),
+      activeTopics: [{ name: "Snowflake", count: 5 }],
+      recentActivity: snowflakeActivity,
+      recommendations: [],
+    });
+
+    await renderRoute("#/dashboard");
+
+    expect(await screen.findByRole("heading", { name: "Snowflake" })).toBeInTheDocument();
+    expect(screen.getByText("5 signals")).toBeInTheDocument();
+    expect(screen.getAllByText(/across Google Chrome, Preview, Cursor/).length).toBeGreaterThan(0);
+    expect(screen.queryByRole("button", { name: /Video research/ })).not.toBeInTheDocument();
   });
 
   it("formats foreground application percentages to one decimal place", async () => {
@@ -198,6 +270,109 @@ describe("dashboard", () => {
     fireEvent.click(await screen.findByRole("button", { name: "7 days" }));
 
     await waitFor(() => expect(dashboardSpy).toHaveBeenCalledWith("7d"));
+  });
+});
+
+describe("dashboard activity preview", () => {
+  beforeEach(stubApi);
+
+  it("requests a preview for the latest URL in the selected thread", async () => {
+    const newestUrl = "https://www.youtube.com/watch?v=moonlight";
+    dashboardWithPreviewEvents([
+      previewEvent("latest-no-url", "2026-08-07T18:00:00.000Z"),
+      previewEvent("latest-url", "2026-08-07T17:00:00.000Z", newestUrl, "Moonlight Sonata"),
+      previewEvent("older-url", "2026-08-07T16:00:00.000Z", "https://example.com/classical"),
+    ]);
+    const activityPreview = vi.spyOn(api, "activityPreview").mockResolvedValue({
+      kind: "youtube",
+      title: "Moonlight Sonata",
+      url: newestUrl,
+      thumbnailDataUrl: "data:image/jpeg;base64,thumbnail",
+      embedUrl: "https://www.youtube-nocookie.com/embed/moonlight",
+    });
+
+    await renderRoute("#/dashboard");
+
+    await waitFor(() => expect(activityPreview).toHaveBeenCalledWith(newestUrl));
+    expect(activityPreview).toHaveBeenCalledTimes(1);
+  });
+
+  it("renders YouTube preview metadata returned by the preview API", async () => {
+    const url = "https://www.youtube.com/watch?v=moonlight";
+    dashboardWithPreviewEvents([
+      previewEvent("youtube", "2026-08-07T17:00:00.000Z", url, "YouTube page title"),
+    ]);
+    vi.spyOn(api, "activityPreview").mockResolvedValue({
+      kind: "youtube",
+      title: "Beethoven — Moonlight Sonata",
+      url,
+      thumbnailDataUrl: "data:image/jpeg;base64,thumbnail",
+      embedUrl: "https://www.youtube-nocookie.com/embed/moonlight",
+    });
+
+    await renderRoute("#/dashboard");
+
+    expect(await screen.findByRole("heading", { name: "Beethoven — Moonlight Sonata" })).toBeInTheDocument();
+    expect(screen.getByRole("img", { name: "Beethoven — Moonlight Sonata preview" })).toHaveAttribute(
+      "src",
+      "data:image/jpeg;base64,thumbnail",
+    );
+  });
+
+  it("replaces the YouTube thumbnail with an embedded player when activated", async () => {
+    const url = "https://www.youtube.com/watch?v=moonlight";
+    dashboardWithPreviewEvents([
+      previewEvent("youtube", "2026-08-07T17:00:00.000Z", url, "Moonlight Sonata"),
+    ]);
+    vi.spyOn(api, "activityPreview").mockResolvedValue({
+      kind: "youtube",
+      title: "Moonlight Sonata",
+      url,
+      thumbnailDataUrl: "data:image/jpeg;base64,thumbnail",
+      embedUrl: "https://www.youtube-nocookie.com/embed/moonlight",
+    });
+    await renderRoute("#/dashboard");
+    await screen.findByRole("img", { name: "Moonlight Sonata preview" });
+
+    fireEvent.click(screen.getByRole("button", { name: "Play Moonlight Sonata preview" }));
+
+    expect(screen.getByTitle("Moonlight Sonata")).toHaveAttribute(
+      "src",
+      "https://www.youtube-nocookie.com/embed/moonlight?autoplay=1",
+    );
+    expect(screen.queryByRole("img", { name: "Moonlight Sonata preview" })).not.toBeInTheDocument();
+  });
+
+  it("keeps generic site previews non-embedded and openable", async () => {
+    const url = "https://example.com/classical-music";
+    dashboardWithPreviewEvents([
+      previewEvent("website", "2026-08-07T17:00:00.000Z", url, "A guide to classical music"),
+    ]);
+    vi.spyOn(api, "activityPreview").mockResolvedValue({
+      kind: "link",
+      title: "A guide to classical music",
+      url,
+    });
+
+    await renderRoute("#/dashboard");
+
+    const openResource = await screen.findByRole("link", { name: "Open resource" });
+    expect(openResource).toHaveAttribute("href", url);
+    expect(openResource).toHaveAttribute("target", "_blank");
+    expect(document.querySelector("iframe")).not.toBeInTheDocument();
+  });
+
+  it("preserves an openable resource when preview loading fails", async () => {
+    const url = "https://example.com/classical-music";
+    dashboardWithPreviewEvents([
+      previewEvent("website", "2026-08-07T17:00:00.000Z", url, "A guide to classical music"),
+    ]);
+    vi.spyOn(api, "activityPreview").mockRejectedValue(new Error("preview unavailable"));
+
+    await renderRoute("#/dashboard");
+
+    expect(await screen.findByText(/Preview unavailable/)).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "Open resource" })).toHaveAttribute("href", url);
   });
 });
 
@@ -278,7 +453,14 @@ describe("settings privacy disclosures", () => {
   it("states which metadata collection includes", async () => {
     await renderRoute("#/settings");
 
-    expect(await screen.findByText("Foreground app, window title, and permitted browser metadata.")).toBeInTheDocument();
+    expect(
+      await screen.findByText(
+        "Foreground app, window title, selected Chrome history, and editor file-save metadata.",
+      ),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/never opens saved code snapshots or source contents/i),
+    ).toBeInTheDocument();
   });
 
   it("re-imports Chrome history and refreshes the profile as one operation", async () => {
@@ -325,6 +507,7 @@ describe("assistant chat", () => {
     fireEvent.click(screen.getByRole("button", { name: /Send/ }));
 
     await waitFor(() => expect(chat).toHaveBeenCalledTimes(1));
+    expect(chat.mock.calls[0][1]).toBe("optimized");
     const sentMessages = chat.mock.calls[0][0];
     expect(sentMessages.map(({ role, content }) => ({ role, content }))).toEqual([
       {
@@ -339,7 +522,7 @@ describe("assistant chat", () => {
     expect(screen.getByText("synced-to-snowflake")).toBeInTheDocument();
   });
 
-  it("can answer with the full-context baseline while preserving the comparison", async () => {
+  it("uses one query-complete answer path while preserving the full-context comparison", async () => {
     const response: ChatMessage = {
       id: "baseline-response",
       role: "assistant",
@@ -349,15 +532,17 @@ describe("assistant chat", () => {
     const chat = vi.spyOn(api, "chat").mockResolvedValue(chatRun(response));
     await renderRoute("#/assistant");
 
-    fireEvent.click(screen.getByRole("button", { name: "Full Context" }));
     fireEvent.change(screen.getByPlaceholderText(/What should I prioritize/), {
       target: { value: "Compare this." },
     });
     fireEvent.click(screen.getByRole("button", { name: /Send/ }));
 
     await waitFor(() => expect(chat).toHaveBeenCalled());
-    expect(chat.mock.calls[0][1]).toBe("baseline");
+    expect(chat.mock.calls[0][1]).toBe("optimized");
+    expect(screen.queryByRole("button", { name: "Full Context" })).not.toBeInTheDocument();
     expect(await screen.findByText("Baseline answer.")).toBeInTheDocument();
+    fireEvent.click(screen.getByText("Compare context payloads"));
+    expect(screen.getByText(/QUERY-SPECIFIC LOCAL ACTIVITY FACTS/)).toBeInTheDocument();
   });
 
   it("passes the selected thread as an inspectable provisional context brief", async () => {
@@ -380,6 +565,10 @@ describe("assistant chat", () => {
     expect(sentMessages[sentMessages.length - 1]?.content).toBe("What next?");
     expect(chat.mock.calls[0][2]).toContain("Context brief: KnowU implementation");
     expect(chat.mock.calls[0][2]).toContain("Treat this as provisional behavioral context");
+    expect(chat.mock.calls[0][2]).toContain("Duration is omitted here");
+    expect(chat.mock.calls[0][2]).not.toContain("Recorded duration");
+    expect(chat.mock.calls[0][2]).not.toContain("Tauri 2 — Security Capabilities");
+    expect(chat.mock.calls[0][2]).not.toContain("https://");
   });
 
   it("sends a message when Enter is pressed", async () => {

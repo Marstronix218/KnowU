@@ -59,7 +59,7 @@ Default posture: work directly.
 
 Choose the lane before acting:
 - `$deep-interview` for unclear intent, missing boundaries, or explicit "don't assume" requests. It clarifies and hands off; it does not implement.
-- `$ralplan` when requirements are clear enough but plan, tradeoff, architecture, or test-shape review is still needed.
+- `$ralplan` is DISABLED in this install: its `omx ralplan preflight` gate is hardcoded to return `unsupported_documented_leader_proof`, so the workflow can never complete. Do NOT select it. Handle plan, tradeoff, architecture, and test-shape review directly in solo mode.
 - `$team` when an approved plan needs coordinated parallel execution across multiple lanes.
 - `$ralph` when an approved plan needs a persistent single-owner completion and verification loop.
 - Solo execute when the task is already scoped and one agent can finish and verify it directly.
@@ -181,7 +181,7 @@ Verification loop: define the claim and success criteria, run the smallest valid
 </verification>
 
 <execution_protocols>
-Mode selection: use `$deep-interview` for unclear intent/boundaries; `$ralplan` for consensus on architecture, tradeoffs, or tests; `$team` for approved multi-lane work; `$ralph` for persistent single-owner completion/verification loops; otherwise execute directly in solo mode. Switch modes only when evidence shows the current lane is mismatched or blocked.
+Mode selection: use `$deep-interview` for unclear intent/boundaries; `$team` for approved multi-lane work; `$ralph` for persistent single-owner completion/verification loops; otherwise execute directly in solo mode. Switch modes only when evidence shows the current lane is mismatched or blocked.
 
 Command routing: use normal Codex repository inspection tools/subagents as the default surface for simple read-only repository lookup tasks; use `omx sparkshell` only for explicit shell-native read-only evidence or bounded verification.
 When to use what:
@@ -201,7 +201,7 @@ Stop / escalate: stop when the task is verified complete, the user says stop/can
 Output contract: Default update/final shape: state current mode, action/result, and evidence or blocker/next step. Keep rationale once; do not restate the full plan every turn; expand only for risk, handoff, or explicit request.
 
 Anti-slop workflow:
-- Cleanup/refactor/deslop work still follows the same `$deep-interview` -> `$ralplan` -> `$team`/`$ralph` path; use `$ai-slop-cleaner` as a bounded helper inside the chosen execution lane, not as a competing top-level workflow.
+- Cleanup/refactor/deslop work still follows the same `$deep-interview` -> `$team`/`$ralph` path (`$ralplan` is disabled, see above); use `$ai-slop-cleaner` as a bounded helper inside the chosen execution lane, not as a competing top-level workflow.
 - Write a cleanup plan before modifying code; lock existing behavior with regression tests first, then make one smell-focused pass at a time.
 - Prefer deletion over addition, and prefer reuse plus boundary repair over new layers.
 - No new dependencies without explicit request.

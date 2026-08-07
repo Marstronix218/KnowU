@@ -16,11 +16,20 @@ export interface ActivityEvent {
   windowTitle?: string;
   url?: string;
   pageTitle?: string;
+  searchQuery?: string;
   browserProfile?: string;
   startedAt: string;
   durationSeconds: number;
   topic?: string;
-  source: "collector" | "chrome" | "history" | "firefox" | "safari";
+  source: "collector" | "chrome" | "history" | "editor" | "firefox" | "safari";
+}
+
+export interface ActivityPreview {
+  kind: "youtube" | "link";
+  url: string;
+  title?: string;
+  thumbnailDataUrl?: string;
+  embedUrl?: string;
 }
 
 export interface TopicInsight {
@@ -127,7 +136,7 @@ export interface ChatMessage {
   createdAt: string;
 }
 
-export type ChatMode = "baseline" | "optimized";
+export type ChatMode = "optimized";
 
 export interface MemoryRecord {
   id: string;

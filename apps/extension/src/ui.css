@@ -68,7 +68,7 @@ h2 {
 .label {
   margin: 0;
   color: #706a72;
-  font-size: 11px;
+  font-size: 12px;
   font-weight: 700;
   letter-spacing: 0.1em;
   text-transform: uppercase;
@@ -103,7 +103,7 @@ h2 {
 .status-line p {
   margin: 4px 0 14px;
   color: #706a72;
-  font-size: 12px;
+  font-size: 13px;
 }
 
 .status-dot {
@@ -168,7 +168,7 @@ h2 {
   overflow: hidden;
   margin: 0;
   color: #706a72;
-  font-size: 12px;
+  font-size: 13px;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -179,7 +179,7 @@ h2 {
   border-radius: 10px;
   color: #71442e;
   background: #f5dfce;
-  font-size: 12px;
+  font-size: 13px;
   line-height: 1.45;
 }
 
@@ -189,7 +189,7 @@ footer {
   justify-content: space-between;
   margin-top: 14px;
   color: #706a72;
-  font-size: 11px;
+  font-size: 12px;
 }
 
 .link-button {
@@ -233,7 +233,7 @@ label {
   gap: 7px;
   margin-top: 18px;
   color: #39333c;
-  font-size: 13px;
+  font-size: 14px;
   font-weight: 700;
 }
 
@@ -285,7 +285,7 @@ textarea:focus {
   min-height: 20px;
   margin: 12px 0 0;
   color: #30775c;
-  font-size: 13px;
+  font-size: 14px;
 }
 
 .form-result.error {

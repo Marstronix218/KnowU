@@ -4,7 +4,7 @@
 //! Secrets are accepted only by `save_provider_key`; no command ever returns a key.
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     fs,
     io::Read,
     path::{Path, PathBuf},
@@ -43,6 +43,7 @@ use crate::{
         import_selected_chrome_history, RuntimeStatus,
     },
     providers::ProviderClient,
+    threading::semantic_topics,
 };
 
 pub struct AppState {
@@ -95,6 +96,9 @@ struct UiUsage {
     color: String,
 }
 
+const RECENT_ACTIVITY_LIMIT: usize = 200;
+const TOPIC_EVIDENCE_LIMIT: usize = 3;
+
 #[tauri::command]
 pub fn get_dashboard(range: String, state: State<'_, AppState>) -> AppResult<Value> {
     let (start_at, end_at) = range_bounds(&range)?;
@@ -107,7 +111,7 @@ pub fn get_dashboard(range: String, state: State<'_, AppState>) -> AppResult<Val
         limit: Some(1000),
         offset: None,
     })?;
-    let recent = history.iter().take(8).cloned().collect::<Vec<_>>();
+    let semantic_topics = semantic_topics(&history);
     let palette = ["#4968a6", "#7c5c9e", "#399279", "#c07a3e", "#7e8798"];
     let behavioral_guidance_enabled = state.db.settings()?.behavioral_guidance_enabled;
     let usage = |values: Vec<crate::models::UsageItem>| {
@@ -170,15 +174,8 @@ pub fn get_dashboard(range: String, state: State<'_, AppState>) -> AppResult<Val
             "evidence":"Observed distinct URLs only; KnowU does not claim they were read, watched, or completed."
         }));
     }
-    let mut topics = BTreeMap::<&str, usize>::new();
-    for event in &history {
-        if let Some(topic) = inferred_topic(event) {
-            *topics.entry(topic).or_default() += 1;
-        }
-    }
-    let mut topics = topics.into_iter().collect::<Vec<_>>();
-    topics.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
-    topics.truncate(5);
+    let topics = ranked_topics(&history, &semantic_topics);
+    let recent = select_dashboard_activity(&history, &semantic_topics, &topics);
     for (topic, count) in topics.iter().take(3) {
         insights.push(json!({
             "id":format!("topic-{}",topic.replace(' ',"-")),
@@ -198,14 +195,94 @@ pub fn get_dashboard(range: String, state: State<'_, AppState>) -> AppResult<Val
         })).collect::<Vec<_>>(),
         "appUsage":usage(dashboard.applications),
         "siteUsage":usage(dashboard.websites),
-        "recentActivity":recent.into_iter().map(activity_to_ui).collect::<Vec<_>>(),
+        "recentActivity":recent.into_iter().map(|event| {
+            let semantic_topic = event.id.and_then(|id| semantic_topics.get(&id));
+            activity_to_ui_with_topic(event, semantic_topic.map(String::as_str))
+        }).collect::<Vec<_>>(),
         "insights":insights,
         "recommendations":recommendations,
         "generatedAt":Utc::now().to_rfc3339()
     }))
 }
 
+fn event_topic(
+    event: &crate::models::ActivityEvent,
+    semantic_topics: &HashMap<i64, String>,
+) -> Option<String> {
+    event
+        .id
+        .and_then(|id| semantic_topics.get(&id).cloned())
+        .or_else(|| inferred_topic(event).map(str::to_string))
+}
+
+fn ranked_topics(
+    history: &[crate::models::ActivityEvent],
+    semantic_topics: &HashMap<i64, String>,
+) -> Vec<(String, usize)> {
+    let mut topics = BTreeMap::<String, usize>::new();
+    for event in history {
+        if let Some(topic) = event_topic(event, semantic_topics) {
+            *topics.entry(topic).or_default() += 1;
+        }
+    }
+    let mut topics = topics.into_iter().collect::<Vec<_>>();
+    topics.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
+    topics.truncate(5);
+    topics
+}
+
+fn select_dashboard_activity(
+    history: &[crate::models::ActivityEvent],
+    semantic_topics: &HashMap<i64, String>,
+    active_topics: &[(String, usize)],
+) -> Vec<crate::models::ActivityEvent> {
+    let mut selected = history
+        .iter()
+        .take(RECENT_ACTIVITY_LIMIT)
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut selected_ids = selected
+        .iter()
+        .filter_map(|event| event.id)
+        .collect::<HashSet<_>>();
+
+    for (topic, _) in active_topics {
+        let already_selected = selected
+            .iter()
+            .filter(|event| event_topic(event, semantic_topics).as_deref() == Some(topic.as_str()))
+            .count();
+        let needed = TOPIC_EVIDENCE_LIMIT.saturating_sub(already_selected);
+        if needed == 0 {
+            continue;
+        }
+        let additions = history
+            .iter()
+            .filter(|event| {
+                event_topic(event, semantic_topics).as_deref() == Some(topic.as_str())
+                    && event.id.is_none_or(|id| !selected_ids.contains(&id))
+            })
+            .take(needed)
+            .cloned()
+            .collect::<Vec<_>>();
+        for event in additions {
+            if let Some(id) = event.id {
+                selected_ids.insert(id);
+            }
+            selected.push(event);
+        }
+    }
+
+    selected.sort_by_key(|event| std::cmp::Reverse(event.occurred_at));
+    selected
+}
+
 fn inferred_topic(event: &crate::models::ActivityEvent) -> Option<&'static str> {
+    if matches!(
+        event.app_name.as_str(),
+        "Code" | "Visual Studio Code" | "Cursor" | "Cortex Code" | "Xcode"
+    ) {
+        return Some("Software development");
+    }
     let text = format!(
         "{} {} {} {}",
         event.app_name,
@@ -256,22 +333,200 @@ pub fn get_activity_history(
     state: State<'_, AppState>,
 ) -> AppResult<Vec<Value>> {
     let (start_at, end_at) = range_bounds(&range)?;
-    Ok(state
-        .db
-        .history(&HistoryRequest {
-            start_at,
-            end_at,
-            search: query,
-            source: None,
-            limit: Some(1000),
-            offset: None,
-        })?
+    let history = state.db.history(&HistoryRequest {
+        start_at,
+        end_at,
+        search: query,
+        source: None,
+        limit: Some(1000),
+        offset: None,
+    })?;
+    let semantic_topics = semantic_topics(&history);
+    Ok(history
         .into_iter()
-        .map(activity_to_ui)
+        .map(|event| {
+            let semantic_topic = event.id.and_then(|id| semantic_topics.get(&id));
+            activity_to_ui_with_topic(event, semantic_topic.map(String::as_str))
+        })
         .collect())
 }
 
 static ACTIVITY_ICON_CACHE: OnceLock<Mutex<HashMap<String, Option<String>>>> = OnceLock::new();
+static ACTIVITY_PREVIEW_CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivityPreview {
+    kind: String,
+    url: String,
+    thumbnail_data_url: Option<String>,
+    embed_url: Option<String>,
+}
+
+#[tauri::command]
+pub async fn get_activity_preview(url: String) -> AppResult<ActivityPreview> {
+    let preview = activity_preview(&url)?;
+    let Some(video_id) = youtube_video_id(&preview.url) else {
+        return Ok(preview);
+    };
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let cache = ACTIVITY_PREVIEW_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+        let cached = cache
+            .lock()
+            .expect("activity preview cache poisoned")
+            .get(&video_id)
+            .cloned();
+        let thumbnail_data_url = cached.or_else(|| {
+            let value = fetch_youtube_thumbnail(&video_id);
+            if let Some(data_url) = value.as_ref() {
+                cache
+                    .lock()
+                    .expect("activity preview cache poisoned")
+                    .insert(video_id, data_url.clone());
+            }
+            value
+        });
+        Ok(ActivityPreview {
+            thumbnail_data_url,
+            ..preview
+        })
+    })
+    .await
+    .map_err(|error| {
+        AppError::InvalidInput(format!("Could not resolve activity preview: {error}"))
+    })?
+}
+
+fn activity_preview(value: &str) -> AppResult<ActivityPreview> {
+    let mut parsed = url::Url::parse(value.trim())
+        .map_err(|_| AppError::InvalidInput("Activity preview URL is invalid.".into()))?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+    {
+        return Err(AppError::InvalidInput(
+            "Activity preview URL must be an HTTP or HTTPS URL without credentials.".into(),
+        ));
+    }
+    parsed.set_fragment(None);
+
+    let Some(video_id) = youtube_video_id(parsed.as_str()) else {
+        return Ok(ActivityPreview {
+            kind: "link".into(),
+            url: parsed.into(),
+            thumbnail_data_url: None,
+            embed_url: None,
+        });
+    };
+
+    Ok(ActivityPreview {
+        kind: "youtube".into(),
+        url: format!("https://www.youtube.com/watch?v={video_id}"),
+        thumbnail_data_url: None,
+        embed_url: Some(format!("https://www.youtube-nocookie.com/embed/{video_id}")),
+    })
+}
+
+fn reopenable_web_url(value: &str) -> AppResult<url::Url> {
+    let parsed = url::Url::parse(value.trim())
+        .map_err(|_| AppError::InvalidInput("The resource URL is invalid.".into()))?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+    {
+        return Err(AppError::InvalidInput(
+            "Only HTTP and HTTPS resources without credentials can be reopened.".into(),
+        ));
+    }
+    Ok(parsed)
+}
+
+#[tauri::command]
+pub fn open_resource(url: String) -> AppResult<()> {
+    let url = reopenable_web_url(&url)?;
+    let status = open_external_url(url.as_str())?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(AppError::InvalidInput(
+            "The system could not open the resource.".into(),
+        ))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn open_external_url(url: &str) -> std::io::Result<std::process::ExitStatus> {
+    Command::new("/usr/bin/open").arg(url).status()
+}
+
+#[cfg(target_os = "windows")]
+fn open_external_url(url: &str) -> std::io::Result<std::process::ExitStatus> {
+    Command::new("rundll32")
+        .args(["url.dll,FileProtocolHandler", url])
+        .status()
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn open_external_url(url: &str) -> std::io::Result<std::process::ExitStatus> {
+    Command::new("xdg-open").arg(url).status()
+}
+
+fn youtube_video_id(value: &str) -> Option<String> {
+    let parsed = url::Url::parse(value).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return None;
+    }
+    let host = parsed
+        .host_str()?
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    let candidate = if host == "youtu.be" || host == "www.youtu.be" {
+        parsed.path_segments()?.next().map(str::to_string)
+    } else if host == "youtube.com" || host.ends_with(".youtube.com") {
+        let mut segments = parsed.path_segments()?;
+        match segments.next() {
+            Some("watch") => parsed
+                .query_pairs()
+                .find_map(|(key, value)| (key == "v").then(|| value.into_owned())),
+            Some("shorts" | "embed" | "live") => segments.next().map(str::to_string),
+            _ => None,
+        }
+    } else if host == "youtube-nocookie.com" || host.ends_with(".youtube-nocookie.com") {
+        let mut segments = parsed.path_segments()?;
+        (segments.next() == Some("embed"))
+            .then(|| segments.next())
+            .flatten()
+            .map(str::to_string)
+    } else {
+        None
+    }?;
+
+    is_valid_youtube_video_id(&candidate).then_some(candidate)
+}
+
+fn is_valid_youtube_video_id(value: &str) -> bool {
+    value.len() == 11
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn fetch_youtube_thumbnail(video_id: &str) -> Option<String> {
+    if !is_valid_youtube_video_id(video_id) {
+        return None;
+    }
+    let client = reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(2))
+        .timeout(Duration::from_secs(4))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .ok()?;
+    let url = url::Url::parse(&format!("https://i.ytimg.com/vi/{video_id}/hqdefault.jpg")).ok()?;
+    fetch_image(&client, url)
+}
 
 #[tauri::command]
 pub async fn get_activity_icon(app_name: String, url: Option<String>) -> AppResult<Option<String>> {
@@ -880,9 +1135,10 @@ pub async fn chat(
         ));
     }
     let mode = mode.unwrap_or_else(|| "optimized".into());
-    if !matches!(mode.as_str(), "baseline" | "optimized") {
+    if mode != "optimized" {
         return Err(AppError::InvalidInput(
-            "Chat mode must be baseline or optimized.".into(),
+            "KnowU answers with compact, query-complete context; Full Context is comparison-only."
+                .into(),
         ));
     }
     let history = messages[..messages.len() - 1]
@@ -926,13 +1182,25 @@ pub async fn chat(
             ),
         )
     };
+    let activity_query = activity_query_text(&last.content, &history, context_brief.as_deref());
+    let (activity_start, activity_end) = query_activity_range(&last.content, today_start, now);
+    let activity_facts =
+        state
+            .db
+            .query_activity_facts(&activity_query, activity_start, activity_end)?;
     let baseline_context = build_baseline_context(
         &profile,
         &corrections,
         &activity_summary,
+        &retrieved_memories,
+        &activity_facts,
         context_brief.as_deref(),
     );
-    let optimized_context = build_optimized_context(&retrieved_memories, context_brief.as_deref());
+    let optimized_context = build_optimized_context(
+        &retrieved_memories,
+        &activity_facts,
+        context_brief.as_deref(),
+    );
     let conversation_text = history
         .iter()
         .map(|message| format!("{}: {}", message.role, message.content))
@@ -942,11 +1210,7 @@ pub async fn chat(
         compose_measured_prompt(&baseline_context, &conversation_text, &last.content);
     let optimized_prompt =
         compose_measured_prompt(&optimized_context, &conversation_text, &last.content);
-    let selected_context = if mode == "baseline" {
-        &baseline_context
-    } else {
-        &optimized_context
-    };
+    let selected_context = &optimized_context;
     let provider_started = Instant::now();
     let completion = state
         .providers
@@ -1225,20 +1489,37 @@ fn stable_profile_id(section: &str, value: &str) -> String {
     format!("inferred-{:x}", digest.finalize())
 }
 
-fn activity_to_ui(event: crate::models::ActivityEvent) -> Value {
+fn activity_to_ui_with_topic(
+    event: crate::models::ActivityEvent,
+    semantic_topic: Option<&str>,
+) -> Value {
+    let topic = semantic_topic.map(str::to_string).or_else(|| {
+        if event.source == crate::models::ActivitySource::EditorHistory {
+            event.window_title.as_deref().and_then(|title| {
+                title
+                    .split_once(" — ")
+                    .map(|(workspace, _)| workspace.to_string())
+            })
+        } else {
+            inferred_topic(&event).map(str::to_string)
+        }
+    });
     json!({
         "id":event.id.unwrap_or_default().to_string(),
         "appName":event.app_name,
         "windowTitle":event.window_title,
         "url":event.url,
         "pageTitle":event.page_title,
+        "searchQuery":event.search_query,
         "browserProfile":event.browser_profile_id,
         "startedAt":timestamp(event.occurred_at),
         "durationSeconds":event.duration_seconds,
+        "topic":topic,
         "source":match event.source {
             crate::models::ActivitySource::AppFocus=>"collector",
             crate::models::ActivitySource::ChromeHistory=>"history",
             crate::models::ActivitySource::ChromeExtension=>"chrome",
+            crate::models::ActivitySource::EditorHistory=>"editor",
         }
     })
 }
@@ -1263,6 +1544,55 @@ fn range_bounds(range: &str) -> AppResult<(i64, i64)> {
         _ => return Err(AppError::InvalidInput("Unsupported date range.".into())),
     };
     Ok((start, now.timestamp()))
+}
+
+fn query_activity_range(query: &str, today_start: i64, now: i64) -> (i64, i64) {
+    let query = query.to_ascii_lowercase();
+    if query.contains("yesterday") {
+        (today_start - 86_400, today_start.saturating_sub(1))
+    } else if query.contains("today") {
+        (today_start, now)
+    } else if query.contains("this week")
+        || query.contains("past week")
+        || query.contains("last week")
+        || query.contains("7 days")
+    {
+        (now - 7 * 86_400, now)
+    } else {
+        (now - 30 * 86_400, now)
+    }
+}
+
+fn activity_query_text(
+    question: &str,
+    history: &[ChatMessage],
+    context_brief: Option<&str>,
+) -> String {
+    let references_prior_subject = question
+        .split(|character: char| !character.is_alphanumeric())
+        .map(str::to_ascii_lowercase)
+        .any(|word| matches!(word.as_str(), "it" | "that" | "this" | "them" | "those"));
+    if !references_prior_subject || crate::db::has_meaningful_activity_subject(question) {
+        return question.into();
+    }
+
+    let mut parts = vec![question.trim().to_string()];
+    if let Some(subject) = context_brief
+        .and_then(|brief| brief.lines().next())
+        .and_then(|line| line.strip_prefix("Context brief:"))
+        .map(str::trim)
+        .filter(|subject| !subject.is_empty())
+    {
+        parts.push(subject.into());
+    }
+    if let Some(previous_question) = history
+        .iter()
+        .rev()
+        .find(|message| message.role == "user" && !message.content.trim().is_empty())
+    {
+        parts.push(previous_question.content.trim().into());
+    }
+    parts.join(" ")
 }
 
 fn timestamp(value: i64) -> String {
@@ -1309,6 +1639,7 @@ fn format_duration(seconds: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::{ActivityEvent, ActivitySource};
 
     #[test]
     fn scheduled_refresh_waits_for_bootstrap_and_runs_once_per_day() {
@@ -1320,6 +1651,56 @@ mod tests {
 
         settings.last_profile_refresh_day = Some("2026-07-27".into());
         assert!(!scheduled_refresh_due(&settings, "2026-07-27"));
+    }
+
+    #[test]
+    fn query_activity_range_honors_explicit_recent_scopes() {
+        let now = 10 * 86_400;
+        let today_start = 9 * 86_400;
+        assert_eq!(
+            query_activity_range("How long did I work today?", today_start, now),
+            (today_start, now)
+        );
+        assert_eq!(
+            query_activity_range("What did I do yesterday?", today_start, now),
+            (today_start - 86_400, today_start - 1)
+        );
+        assert_eq!(
+            query_activity_range("How much Snowflake time this week?", today_start, now),
+            (now - 7 * 86_400, now)
+        );
+        assert_eq!(
+            query_activity_range("Since when have I used Snowflake?", today_start, now),
+            (now - 30 * 86_400, now)
+        );
+    }
+
+    #[test]
+    fn activity_query_text_resolves_follow_up_subjects_from_recent_context() {
+        let history = vec![ChatMessage {
+            role: "user".into(),
+            content: "Tell me about Snowflake.".into(),
+        }];
+        assert_eq!(
+            activity_query_text("How long have I worked on it?", &history, None),
+            "How long have I worked on it? Tell me about Snowflake."
+        );
+        assert_eq!(
+            activity_query_text(
+                "How long on this?",
+                &[],
+                Some("Context brief: Snowflake\n\n38 local signals."),
+            ),
+            "How long on this? Snowflake"
+        );
+        assert_eq!(
+            activity_query_text(
+                "How long on this Snowflake project?",
+                &history,
+                Some("Context brief: BigQuery"),
+            ),
+            "How long on this Snowflake project?"
+        );
     }
 
     #[test]
@@ -1380,5 +1761,136 @@ mod tests {
     fn activity_icon_parser_finds_declared_shortcut_icons() {
         let html = r#"<html><head><link rel="shortcut icon" href="/favicon.svg" type="image/svg+xml"></head></html>"#;
         assert_eq!(declared_icon_href(html).as_deref(), Some("/favicon.svg"));
+    }
+
+    #[test]
+    fn activity_preview_normalizes_supported_youtube_video_urls() {
+        for value in [
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=20",
+            "https://youtu.be/dQw4w9WgXcQ?si=example",
+            "https://music.youtube.com/watch?v=dQw4w9WgXcQ",
+            "https://www.youtube.com/shorts/dQw4w9WgXcQ",
+            "https://www.youtube-nocookie.com/embed/dQw4w9WgXcQ",
+        ] {
+            let preview = activity_preview(value).expect("YouTube URL should be accepted");
+            assert_eq!(preview.kind, "youtube");
+            assert_eq!(preview.url, "https://www.youtube.com/watch?v=dQw4w9WgXcQ");
+            assert_eq!(
+                preview.embed_url.as_deref(),
+                Some("https://www.youtube-nocookie.com/embed/dQw4w9WgXcQ")
+            );
+            assert_eq!(preview.thumbnail_data_url, None);
+        }
+    }
+
+    #[test]
+    fn activity_preview_keeps_non_video_and_lookalike_hosts_link_only() {
+        for value in [
+            "https://www.youtube.com/playlist?list=PL123",
+            "https://youtube.com.evil.example/watch?v=dQw4w9WgXcQ",
+            "https://example.com/article#section",
+        ] {
+            let preview = activity_preview(value).expect("ordinary web URL should be accepted");
+            assert_eq!(preview.kind, "link");
+            assert_eq!(preview.thumbnail_data_url, None);
+            assert_eq!(preview.embed_url, None);
+            assert!(!preview.url.contains('#'));
+        }
+    }
+
+    #[test]
+    fn activity_preview_rejects_unsafe_urls_and_invalid_video_ids() {
+        for value in [
+            "javascript:alert(1)",
+            "file:///tmp/private",
+            "https://user:secret@example.com/",
+        ] {
+            assert!(activity_preview(value).is_err());
+        }
+
+        let preview = activity_preview("https://youtube.com/watch?v=../../secret")
+            .expect("invalid video id should safely fall back to a link");
+        assert_eq!(preview.kind, "link");
+        assert!(youtube_video_id(&preview.url).is_none());
+    }
+
+    #[test]
+    fn reopenable_resources_allow_only_hosted_web_urls() {
+        assert!(reopenable_web_url("https://example.com/work").is_ok());
+        assert!(reopenable_web_url("http://localhost:1420/dashboard").is_ok());
+        assert!(reopenable_web_url("file:///tmp/private.txt").is_err());
+        assert!(reopenable_web_url("javascript:alert(1)").is_err());
+        assert!(reopenable_web_url("https://user:secret@example.com/").is_err());
+        assert!(reopenable_web_url("not a url").is_err());
+    }
+
+    #[test]
+    fn activity_ui_prefers_semantic_subject_and_includes_search_evidence() {
+        let event = ActivityEvent {
+            id: Some(42),
+            occurred_at: 1,
+            ended_at: None,
+            duration_seconds: 0,
+            app_name: "Google Chrome".into(),
+            window_title: Some("snowflake - Google Search".into()),
+            url: Some("https://google.com/search?q=snowflake".into()),
+            page_title: Some("snowflake - Google Search".into()),
+            search_query: Some("snowflake architecture".into()),
+            browser_profile_id: Some("Default".into()),
+            source: ActivitySource::ChromeHistory,
+            is_bootstrap: false,
+        };
+
+        let value = activity_to_ui_with_topic(event, Some("Snowflake"));
+
+        assert_eq!(value["topic"], "Snowflake");
+        assert_eq!(value["searchQuery"], "snowflake architecture");
+    }
+
+    #[test]
+    fn dashboard_activity_preserves_video_evidence_beyond_global_recent_limit() {
+        let mut history = (0..250)
+            .map(|index| ActivityEvent {
+                id: Some(1_000 + index),
+                occurred_at: 10_000 - index,
+                ended_at: None,
+                duration_seconds: 5,
+                app_name: "Finder".into(),
+                window_title: Some(format!("Folder {index}")),
+                url: None,
+                page_title: None,
+                search_query: None,
+                browser_profile_id: None,
+                source: ActivitySource::AppFocus,
+                is_bootstrap: false,
+            })
+            .collect::<Vec<_>>();
+        history.extend((0..3).map(|index| ActivityEvent {
+            id: Some(10 + index),
+            occurred_at: 1_000 - index,
+            ended_at: None,
+            duration_seconds: 0,
+            app_name: "Google Chrome".into(),
+            window_title: None,
+            url: Some(format!("https://youtube.com/watch?v=research-{index}")),
+            page_title: Some(format!("Research video {index}")),
+            search_query: None,
+            browser_profile_id: Some("Default".into()),
+            source: ActivitySource::ChromeHistory,
+            is_bootstrap: false,
+        }));
+        let semantic_topics = HashMap::new();
+        let topics = ranked_topics(&history, &semantic_topics);
+
+        let selected = select_dashboard_activity(&history, &semantic_topics, &topics);
+
+        assert_eq!(
+            selected
+                .iter()
+                .filter(|event| inferred_topic(event) == Some("Video research"))
+                .count(),
+            3
+        );
+        assert!(selected.len() > RECENT_ACTIVITY_LIMIT);
     }
 }

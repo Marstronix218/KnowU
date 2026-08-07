@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{Mutex, MutexGuard},
 };
@@ -12,7 +12,7 @@ use crate::{
     error::{AppError, AppResult},
     models::{
         ActivityEvent, ActivitySource, Dashboard, DashboardRequest, HistoryRequest,
-        ProfileDocument, Recommendation, Settings, UsageItem, UserCorrection,
+        ProfileDocument, QueryActivityFacts, Recommendation, Settings, UsageItem, UserCorrection,
     },
 };
 
@@ -592,6 +592,24 @@ impl Database {
             })?
             .collect::<Result<Vec<_>, _>>()?;
 
+        let mut editor_statement = conn.prepare(
+            "SELECT app_name,COALESCE(window_title,''),MAX(occurred_at),COUNT(*)
+             FROM activity_events
+             WHERE occurred_at BETWEEN ?1 AND ?2 AND source='editor_history'
+             GROUP BY app_name,window_title
+             ORDER BY MAX(occurred_at) DESC LIMIT 20",
+        )?;
+        let recent_editor_changes = editor_statement
+            .query_map(params![start_at, end_at], |row| {
+                Ok(serde_json::json!({
+                    "editor":row.get::<_,String>(0)?,
+                    "resource":row.get::<_,String>(1)?,
+                    "lastChangedAt":row.get::<_,i64>(2)?,
+                    "changes":row.get::<_,i64>(3)?
+                }))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
         Ok(serde_json::json!({
             "startAt":start_at,
             "endAt":end_at,
@@ -600,8 +618,156 @@ impl Database {
             "liveBrowserSeconds":live_browser_seconds,
             "applicationTime":applications,
             "liveWebsiteTime":live_sites,
-            "historicalWebsiteVisits":historical_sites
+            "historicalWebsiteVisits":historical_sites,
+            "recentEditorChanges":recent_editor_changes
         }))
+    }
+
+    pub fn query_activity_facts(
+        &self,
+        query: &str,
+        start_at: i64,
+        end_at: i64,
+    ) -> AppResult<Vec<QueryActivityFacts>> {
+        let terms = meaningful_query_terms(query);
+        let searches = if terms.is_empty() && activity_metric_intent(query) {
+            vec![None]
+        } else {
+            terms.into_iter().map(Some).collect::<Vec<_>>()
+        };
+        if searches.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let conn = self.conn();
+        let mut facts = Vec::new();
+        for term in searches {
+            let mut sql = String::from(
+                "SELECT occurred_at,ended_at,duration_seconds,source,
+                        lower(COALESCE(app_name,'') || ' ' || COALESCE(window_title,'') || ' ' ||
+                              COALESCE(url,'') || ' ' || COALESCE(page_title,'') || ' ' ||
+                              COALESCE(search_query,''))
+                 FROM activity_events
+                 WHERE (
+                   (source IN ('app_focus','chrome_extension')
+                    AND occurred_at<=?2
+                    AND MAX(COALESCE(ended_at,occurred_at),
+                            occurred_at + MAX(duration_seconds,0))>=?1)
+                   OR
+                   (source NOT IN ('app_focus','chrome_extension')
+                    AND occurred_at BETWEEN ?1 AND ?2)
+                 )",
+            );
+            if term.is_some() {
+                sql.push_str(
+                    " AND lower(COALESCE(app_name,'') || ' ' || COALESCE(window_title,'') || ' ' ||
+                     COALESCE(url,'') || ' ' || COALESCE(page_title,'') || ' ' ||
+                     COALESCE(search_query,'')) LIKE ?3",
+                );
+            }
+            let mut statement = conn.prepare(&sql)?;
+            let pattern = term.as_ref().map(|value| format!("%{value}%"));
+            let rows = if let Some(pattern) = pattern.as_deref() {
+                statement.query_map(params![start_at, end_at, pattern], map_fact_event)?
+            } else {
+                statement.query_map(params![start_at, end_at], map_fact_event)?
+            };
+
+            let mut matched_events = 0_i64;
+            let mut first_seen_at = i64::MAX;
+            let mut last_seen_at = i64::MIN;
+            let mut active_intervals = Vec::new();
+            let mut app_focus_seconds = 0_i64;
+            let mut live_browser_seconds = 0_i64;
+            let mut historical_visits = 0_i64;
+            let mut historical_reported_seconds = 0_i64;
+            let mut editor_changes = 0_i64;
+
+            for row in rows {
+                let (occurred_at, ended_at, duration_seconds, source, searchable_text) = row?;
+                if term
+                    .as_deref()
+                    .is_some_and(|term| !metadata_contains_query_term(&searchable_text, term))
+                {
+                    continue;
+                }
+                matched_events += 1;
+                let is_live = matches!(
+                    source,
+                    ActivitySource::AppFocus | ActivitySource::ChromeExtension
+                );
+                let observed_start = if is_live {
+                    occurred_at.max(start_at)
+                } else {
+                    occurred_at
+                };
+                first_seen_at = first_seen_at.min(observed_start);
+                let reliable_end = if is_live {
+                    ended_at
+                        .unwrap_or(occurred_at)
+                        .max(occurred_at.saturating_add(duration_seconds.max(0)))
+                        .min(end_at)
+                } else {
+                    occurred_at
+                };
+                last_seen_at = last_seen_at.max(reliable_end);
+
+                match source {
+                    ActivitySource::AppFocus => {
+                        app_focus_seconds = app_focus_seconds
+                            .saturating_add(reliable_end.saturating_sub(observed_start));
+                        active_intervals.push((observed_start, reliable_end));
+                    }
+                    ActivitySource::ChromeExtension => {
+                        live_browser_seconds = live_browser_seconds
+                            .saturating_add(reliable_end.saturating_sub(observed_start));
+                        active_intervals.push((observed_start, reliable_end));
+                    }
+                    ActivitySource::ChromeHistory => {
+                        historical_visits += 1;
+                        historical_reported_seconds =
+                            historical_reported_seconds.saturating_add(duration_seconds.max(0));
+                    }
+                    ActivitySource::EditorHistory => editor_changes += 1,
+                }
+            }
+
+            if matched_events == 0 {
+                continue;
+            }
+            let subject = term
+                .as_deref()
+                .map(display_query_subject)
+                .unwrap_or_else(|| "All tracked activity".into());
+            facts.push(QueryActivityFacts {
+                subject,
+                match_basis: if term.is_some() {
+                    "exact query-term metadata match".into()
+                } else {
+                    "general activity-time request".into()
+                },
+                matched_events,
+                first_seen_at,
+                last_seen_at,
+                observed_span_seconds: last_seen_at.saturating_sub(first_seen_at),
+                observed_active_seconds: merged_interval_seconds(&mut active_intervals),
+                app_focus_seconds,
+                live_browser_seconds,
+                historical_visits,
+                historical_reported_seconds,
+                editor_changes,
+                coverage_start_at: start_at,
+                coverage_end_at: end_at,
+            });
+        }
+        facts.sort_by(|left, right| {
+            query_subject_priority(&right.subject)
+                .cmp(&query_subject_priority(&left.subject))
+                .then_with(|| right.matched_events.cmp(&left.matched_events))
+                .then_with(|| right.subject.len().cmp(&left.subject.len()))
+        });
+        facts.truncate(3);
+        Ok(facts)
     }
 
     pub fn record_inference_run(
@@ -759,6 +925,182 @@ fn map_activity(row: &rusqlite::Row<'_>) -> rusqlite::Result<ActivityEvent> {
         source: ActivitySource::try_from(source.as_str()).unwrap_or(ActivitySource::AppFocus),
         is_bootstrap: row.get(11)?,
     })
+}
+
+fn map_fact_event(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<(i64, Option<i64>, i64, ActivitySource, String)> {
+    let source = row.get::<_, String>(3)?;
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        ActivitySource::try_from(source.as_str()).unwrap_or(ActivitySource::AppFocus),
+        row.get(4)?,
+    ))
+}
+
+fn metadata_contains_query_term(text: &str, term: &str) -> bool {
+    let tokens = text
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .collect::<HashSet<_>>();
+    if !tokens.contains(term) {
+        return false;
+    }
+    !(term == "snowflake" && crate::threading::is_natural_snowflake_context(text))
+}
+
+fn query_subject_priority(subject: &str) -> usize {
+    matches!(
+        subject,
+        "BigQuery" | "Databricks" | "OpenAI" | "PostgreSQL" | "Snowflake"
+    ) as usize
+}
+
+fn meaningful_query_terms(query: &str) -> Vec<String> {
+    let mut terms = Vec::new();
+    let mut seen = HashSet::new();
+    for term in query
+        .split(|character: char| !character.is_alphanumeric())
+        .map(str::to_ascii_lowercase)
+        .filter(|term| {
+            term.len() >= 4
+                && !term.chars().all(|character| character.is_numeric())
+                && !is_activity_query_stopword(term)
+        })
+    {
+        if seen.insert(term.clone()) {
+            terms.push(term);
+        }
+    }
+    terms
+}
+
+pub(crate) fn has_meaningful_activity_subject(query: &str) -> bool {
+    !meaningful_query_terms(query).is_empty()
+}
+
+fn is_activity_query_stopword(value: &str) -> bool {
+    matches!(
+        value,
+        "about"
+            | "answer"
+            | "activity"
+            | "architecture"
+            | "been"
+            | "browser"
+            | "chrome"
+            | "could"
+            | "days"
+            | "does"
+            | "doing"
+            | "done"
+            | "during"
+            | "first"
+            | "from"
+            | "have"
+            | "hours"
+            | "information"
+            | "last"
+            | "long"
+            | "many"
+            | "minutes"
+            | "month"
+            | "much"
+            | "overall"
+            | "please"
+            | "project"
+            | "recent"
+            | "recently"
+            | "show"
+            | "should"
+            | "since"
+            | "spend"
+            | "spent"
+            | "start"
+            | "started"
+            | "tell"
+            | "that"
+            | "these"
+            | "this"
+            | "time"
+            | "today"
+            | "total"
+            | "tracked"
+            | "using"
+            | "week"
+            | "what"
+            | "when"
+            | "where"
+            | "which"
+            | "while"
+            | "with"
+            | "work"
+            | "worked"
+            | "working"
+            | "would"
+            | "your"
+            | "yesterday"
+    )
+}
+
+fn activity_metric_intent(query: &str) -> bool {
+    let query = query.to_ascii_lowercase();
+    let words = query
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .collect::<HashSet<_>>();
+    [
+        "work", "worked", "working", "spend", "spent", "activity", "tracked",
+    ]
+    .iter()
+    .any(|term| words.contains(term))
+        && ["how long", "how much", "time", "hours", "minutes"]
+            .iter()
+            .any(|term| query.contains(term))
+}
+
+fn display_query_subject(value: &str) -> String {
+    match value {
+        "bigquery" => "BigQuery".into(),
+        "databricks" => "Databricks".into(),
+        "openai" => "OpenAI".into(),
+        "postgresql" => "PostgreSQL".into(),
+        "snowflake" => "Snowflake".into(),
+        _ => {
+            let mut characters = value.chars();
+            characters
+                .next()
+                .map(|first| first.to_uppercase().collect::<String>() + characters.as_str())
+                .unwrap_or_default()
+        }
+    }
+}
+
+fn merged_interval_seconds(intervals: &mut [(i64, i64)]) -> i64 {
+    intervals.sort_unstable_by_key(|(start, _)| *start);
+    let mut total = 0_i64;
+    let mut current: Option<(i64, i64)> = None;
+    for &(start, end) in intervals.iter() {
+        if end <= start {
+            continue;
+        }
+        current = match current {
+            None => Some((start, end)),
+            Some((current_start, current_end)) if start <= current_end => {
+                Some((current_start, current_end.max(end)))
+            }
+            Some((current_start, current_end)) => {
+                total = total.saturating_add(current_end.saturating_sub(current_start));
+                Some((start, end))
+            }
+        };
+    }
+    if let Some((start, end)) = current {
+        total = total.saturating_add(end.saturating_sub(start));
+    }
+    total
 }
 
 fn domain_only(value: &str) -> String {
@@ -926,6 +1268,173 @@ mod tests {
             "youtube.com"
         );
         assert_eq!(summary["historicalWebsiteVisits"][0]["visits"], 1);
+    }
+
+    #[test]
+    fn chat_summary_includes_recent_editor_metadata_without_counting_it_as_focus_time() {
+        let db = Database::in_memory().unwrap();
+        let mut editor_change = event(300, false);
+        editor_change.app_name = "Visual Studio Code".into();
+        editor_change.window_title = Some("KnowU — src/platform.rs".into());
+        editor_change.page_title = Some("src/platform.rs".into());
+        editor_change.duration_seconds = 0;
+        editor_change.ended_at = None;
+        editor_change.source = ActivitySource::EditorHistory;
+        db.insert_event(&editor_change, "editor-change").unwrap();
+
+        let summary = db.chat_activity_summary(0, 1_000).unwrap();
+
+        assert_eq!(summary["trackedSeconds"], 0);
+        assert_eq!(
+            summary["recentEditorChanges"][0]["editor"],
+            "Visual Studio Code"
+        );
+        assert_eq!(
+            summary["recentEditorChanges"][0]["resource"],
+            "KnowU — src/platform.rs"
+        );
+        assert_eq!(summary["recentEditorChanges"][0]["changes"], 1);
+    }
+
+    #[test]
+    fn query_activity_facts_are_compact_and_separate_span_from_observed_time() {
+        let db = Database::in_memory().unwrap();
+
+        let mut historical = event(100, false);
+        historical.app_name = "Google Chrome".into();
+        historical.page_title = Some("Snowflake architecture".into());
+        historical.url = Some("https://app.snowflake.com/example/secret".into());
+        historical.duration_seconds = 50_000;
+        historical.source = ActivitySource::ChromeHistory;
+        db.insert_event(&historical, "snowflake-history").unwrap();
+
+        let mut live_browser = event(200, false);
+        live_browser.app_name = "Google Chrome".into();
+        live_browser.search_query = Some("Snowflake architecture".into());
+        live_browser.duration_seconds = 600;
+        live_browser.source = ActivitySource::ChromeExtension;
+        db.insert_event(&live_browser, "snowflake-live").unwrap();
+
+        let mut editor = event(300, false);
+        editor.app_name = "Cursor".into();
+        editor.window_title = Some("KnowU — src/snowflake_client.rs".into());
+        editor.duration_seconds = 0;
+        editor.ended_at = None;
+        editor.source = ActivitySource::EditorHistory;
+        db.insert_event(&editor, "snowflake-editor").unwrap();
+
+        let mut app = event(400, false);
+        app.window_title = Some("Snowflake hackathon notes".into());
+        app.duration_seconds = 300;
+        db.insert_event(&app, "snowflake-app").unwrap();
+
+        let mut unrelated = event(500, false);
+        unrelated.window_title = Some("Slack".into());
+        db.insert_event(&unrelated, "unrelated").unwrap();
+
+        let facts = db
+            .query_activity_facts("How long have I been working on snowflake?", 0, 1_000)
+            .unwrap();
+
+        assert_eq!(facts.len(), 1);
+        let facts = &facts[0];
+        assert_eq!(facts.subject, "Snowflake");
+        assert_eq!(facts.matched_events, 4);
+        assert_eq!(facts.first_seen_at, 100);
+        assert_eq!(facts.last_seen_at, 800);
+        assert_eq!(facts.observed_span_seconds, 700);
+        assert_eq!(facts.observed_active_seconds, 600);
+        assert_eq!(facts.app_focus_seconds, 300);
+        assert_eq!(facts.live_browser_seconds, 600);
+        assert_eq!(facts.historical_visits, 1);
+        assert_eq!(facts.historical_reported_seconds, 50_000);
+        assert_eq!(facts.editor_changes, 1);
+
+        let serialized = serde_json::to_string(facts).unwrap();
+        for forbidden in [
+            "example/secret",
+            "windowTitle",
+            "pageTitle",
+            "searchQuery",
+            "browserProfileId",
+        ] {
+            assert!(!serialized.contains(forbidden));
+        }
+    }
+
+    #[test]
+    fn query_activity_facts_support_general_time_questions_without_dumping_rows() {
+        let db = Database::in_memory().unwrap();
+        db.insert_event(&event(100, false), "activity").unwrap();
+
+        let facts = db
+            .query_activity_facts("How long have I been working today?", 0, 1_000)
+            .unwrap();
+
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].subject, "All tracked activity");
+        assert_eq!(facts[0].matched_events, 1);
+    }
+
+    #[test]
+    fn query_activity_facts_do_not_mix_snowflake_weather_with_the_company() {
+        let db = Database::in_memory().unwrap();
+        let mut company = event(100, false);
+        company.page_title = Some("Snowflake data warehouse".into());
+        db.insert_event(&company, "company").unwrap();
+
+        let mut weather = event(200, false);
+        weather.page_title = Some("How a snowflake forms in winter weather".into());
+        db.insert_event(&weather, "weather").unwrap();
+
+        let mut photography = event(300, false);
+        photography.page_title = Some("Snowflake macro photography".into());
+        db.insert_event(&photography, "photography").unwrap();
+
+        let mut storm = event(400, false);
+        storm.page_title = Some("Snowflake forecast during a snow storm".into());
+        db.insert_event(&storm, "storm").unwrap();
+
+        let facts = db
+            .query_activity_facts("How long did I use Snowflake?", 0, 1_000)
+            .unwrap();
+
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].matched_events, 1);
+        assert_eq!(facts[0].first_seen_at, 100);
+    }
+
+    #[test]
+    fn query_activity_facts_include_live_sessions_overlapping_the_range_start() {
+        let db = Database::in_memory().unwrap();
+        let mut session = event(50, false);
+        session.window_title = Some("Snowflake worksheet".into());
+        session.ended_at = Some(150);
+        session.duration_seconds = 100;
+        db.insert_event(&session, "cross-boundary").unwrap();
+
+        let facts = db
+            .query_activity_facts("Snowflake time today", 100, 200)
+            .unwrap();
+
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].first_seen_at, 100);
+        assert_eq!(facts[0].last_seen_at, 150);
+        assert_eq!(facts[0].observed_active_seconds, 50);
+    }
+
+    #[test]
+    fn query_activity_facts_match_metadata_tokens_not_substrings() {
+        let db = Database::in_memory().unwrap();
+        let mut javascript = event(100, false);
+        javascript.window_title = Some("JavaScript documentation".into());
+        db.insert_event(&javascript, "javascript").unwrap();
+
+        let facts = db
+            .query_activity_facts("How much Java time?", 0, 1_000)
+            .unwrap();
+
+        assert!(facts.is_empty());
     }
 
     #[test]

@@ -35,7 +35,6 @@ import { api, isDesktopRuntime } from "./lib/api";
 import { domainFromUrl, formatDuration, formatPercentage, formatTime } from "./lib/format";
 import type {
   ActivityEvent,
-  ChatMode,
   ChatMessage,
   ContextEconomics,
   DashboardData,
@@ -418,17 +417,24 @@ function deriveThreads(data: DashboardData): WorkThread[] {
 }
 
 function makeContextBrief(thread: WorkThread): string {
-  const evidence = thread.events.slice(0, 4).map((event) => {
-    const resource = event.pageTitle || event.windowTitle || event.appName;
-    return `- ${resource} (${domainFromUrl(event.url) || event.appName}, ${formatDuration(event.durationSeconds)})`;
-  });
+  const apps = [...new Set(thread.events.map((event) => event.appName))].slice(0, 3);
+  const oldest = thread.events[thread.events.length - 1]?.startedAt;
   return [
     `Context brief: ${thread.title}`,
-    thread.summary,
-    `Suggested next move: ${thread.nextMove}`,
-    evidence.length ? `Recent evidence:\n${evidence.join("\n")}` : "Recent evidence: no detailed event is available in this range.",
+    `${thread.events.length} locally observed signals${apps.length ? ` across ${apps.join(", ")}` : ""}.`,
+    oldest && thread.lastActiveAt
+      ? `Observed from ${formatContextDateTime(oldest)} through ${formatContextDateTime(thread.lastActiveAt)}.`
+      : "No detailed timing evidence is available in this range.",
+    "Duration is omitted here because imported browser-history time is not reliable foreground time. Detailed titles, URLs, searches, and event rows remain local.",
     "Treat this as provisional behavioral context, not confirmed user intent.",
   ].join("\n\n");
+}
+
+function formatContextDateTime(value: string): string {
+  return new Intl.DateTimeFormat(undefined, {
+    dateStyle: "medium",
+    timeStyle: "short",
+  }).format(new Date(value));
 }
 
 function DashboardContent({ data }: { data: DashboardData }) {
@@ -448,11 +454,16 @@ function DashboardContent({ data }: { data: DashboardData }) {
     localStorage.setItem("knowu.selected-thread", id);
     setActionMessage("");
   };
-  const resume = () => {
+  const resume = async () => {
     const target = selected.events.find((event) => event.url)?.url;
     if (target) {
-      window.open(target, "_blank", "noopener,noreferrer");
-      setActionMessage("Opened the latest available resource.");
+      setActionMessage("Opening the latest available resource…");
+      try {
+        await api.openResource(target);
+        setActionMessage("Opened the latest available resource.");
+      } catch {
+        setActionMessage("Could not open the latest available resource.");
+      }
     } else {
       setActionMessage("No reopenable web resource is available. The context brief is ready to use.");
     }
@@ -480,13 +491,13 @@ function DashboardContent({ data }: { data: DashboardData }) {
           <p>{selected.summary}</p>
           <div className="next-move"><Sparkles size={17} /><span><small>Suggested next move</small><strong>{selected.nextMove}</strong></span></div>
           <div className="resume-actions">
-            <button className="primary-button large" onClick={resume}>Resume thread <ArrowUpRight size={17} /></button>
+            <button className="primary-button large" onClick={() => void resume()}>Resume thread <ArrowUpRight size={17} /></button>
             <a className="ghost-button large" href="#/assistant" onClick={prepareAssistant}><MessageSquareText size={17} /> Ask with context</a>
             <button className="ghost-button large" onClick={() => void copyBrief()}><Copy size={17} /> Copy brief</button>
           </div>
           {actionMessage && <p className="action-message" role="status">{actionMessage}</p>}
         </div>
-        <EvidenceRail events={selected.events} />
+        <EvidenceRail events={selected.events} previewEvent={selected.events.find((event) => event.url)} />
       </section>
 
       <section className="thread-section">
@@ -565,16 +576,101 @@ function DonutSummary({ items }: { items: UsageSlice[] }) {
   );
 }
 
-function EvidenceRail({ events }: { events: ActivityEvent[] }) {
+function ActivityPreviewCard({ event }: { event: ActivityEvent }) {
+  const resource = useResource(() => api.activityPreview(event.url!), [event.url]);
+  const [playing, setPlaying] = useState(false);
+  const [thumbnailFailed, setThumbnailFailed] = useState(false);
+  const [openError, setOpenError] = useState("");
+  const title = event.pageTitle || event.windowTitle || event.appName;
+
+  useEffect(() => {
+    setPlaying(false);
+    setThumbnailFailed(false);
+    setOpenError("");
+  }, [event.url]);
+
+  const openLink = (
+    <a className="preview-link" href={event.url} target="_blank" rel="noreferrer" onClick={(clickEvent) => {
+      if (!isDesktopRuntime()) return;
+      clickEvent.preventDefault();
+      setOpenError("");
+      void api.openResource(event.url!).catch(() => setOpenError("Could not open this resource."));
+    }}>
+      Open resource <ArrowUpRight size={13} />
+    </a>
+  );
+
+  if (resource.loading) {
+    return (
+      <section className="activity-preview loading" aria-label="Activity preview">
+        <div className="preview-placeholder"><LoaderCircle size={20} className="spin" /></div>
+        <div className="preview-copy"><span>Recent resource</span><h3>{title}</h3><small>Loading preview…</small></div>
+      </section>
+    );
+  }
+
+  if (resource.error || !resource.data) {
+    return (
+      <section className="activity-preview" aria-label="Activity preview">
+        <div className="preview-generic"><ActivityLogo event={event} /></div>
+        <div className="preview-copy"><span>Recent resource</span><h3>{title}</h3><small>Preview unavailable · the original resource is still available.</small>{openLink}{openError && <small className="preview-error" role="status">{openError}</small>}</div>
+      </section>
+    );
+  }
+
+  const preview = resource.data;
+  const previewTitle = preview.title?.trim() || title;
+  const playerUrl = preview.embedUrl
+    ? `${preview.embedUrl}${preview.embedUrl.includes("?") ? "&" : "?"}autoplay=1`
+    : undefined;
+  const canPlay = preview.kind === "youtube" && Boolean(playerUrl);
+  const hasThumbnail = Boolean(preview.thumbnailDataUrl) && !thumbnailFailed;
+
+  return (
+    <section className={`activity-preview ${preview.kind}`} aria-label="Activity preview">
+      {playing && playerUrl ? (
+        <div className="preview-media">
+          <iframe
+            src={playerUrl}
+            title={previewTitle}
+            allow="autoplay; encrypted-media; picture-in-picture; web-share"
+            referrerPolicy="strict-origin-when-cross-origin"
+            sandbox="allow-scripts allow-same-origin allow-presentation allow-popups"
+            allowFullScreen
+          />
+        </div>
+      ) : canPlay ? (
+        <button className={`preview-media preview-trigger${hasThumbnail ? "" : " no-image"}`} aria-label={`Play ${previewTitle} preview`} onClick={() => setPlaying(true)}>
+          {hasThumbnail && <img src={preview.thumbnailDataUrl} alt={`${previewTitle} preview`} onError={() => setThumbnailFailed(true)} />}
+          {!hasThumbnail && <ActivityLogo event={event} />}
+          <span><Play size={18} fill="currentColor" /> Play preview</span>
+        </button>
+      ) : (
+        <div className="preview-generic"><ActivityLogo event={event} /></div>
+      )}
+      <div className="preview-copy">
+        <span>{preview.kind === "youtube" ? "Recent video" : "Recent resource"}</span>
+        <h3>{previewTitle}</h3>
+        <small>{domainFromUrl(event.url) || event.appName} · {formatTime(event.startedAt)}</small>
+        <small>{preview.kind === "youtube" ? "YouTube loads only after you press play." : "Live sites are not embedded inside KnowU."}</small>
+        {openLink}
+        {openError && <small className="preview-error" role="status">{openError}</small>}
+      </div>
+    </section>
+  );
+}
+
+function EvidenceRail({ events, previewEvent }: { events: ActivityEvent[]; previewEvent?: ActivityEvent }) {
   return (
     <div className="evidence-rail">
+      {previewEvent && <ActivityPreviewCard event={previewEvent} />}
       <div className="evidence-heading"><Eye size={16} /><span>Why this thread?</span><small>Observed locally</small></div>
-      {events.length ? events.slice(0, 4).map((event, index) => (
+      {events.length ? events.slice(0, previewEvent ? 3 : 4).map((event, index) => (
         <article key={event.id}>
           <span className="evidence-index">{String(index + 1).padStart(2, "0")}</span>
           <ActivityLogo event={event} />
           <div><strong>{event.pageTitle || event.windowTitle || event.appName}</strong><small>{domainFromUrl(event.url) || event.appName} · {formatTime(event.startedAt)}</small></div>
-          <time>{formatDuration(event.durationSeconds)}</time>
+          <time>{activityMeasure(event)}</time>
         </article>
       )) : <p className="evidence-empty">This topic is inferred from aggregate signals; no detailed event is available in this range.</p>}
     </div>
@@ -587,7 +683,7 @@ function ThreadCard({ thread, selected = false, onSelect }: { thread: WorkThread
       <span className="thread-card-top"><span className={`thread-state ${thread.status}`} />{thread.status}<small>{thread.lastActiveAt ? formatTime(thread.lastActiveAt) : "Needs review"}</small></span>
       <strong>{thread.title}</strong>
       <p>{thread.summary}</p>
-      <span className="thread-meta"><span>{thread.events.length} signals</span><span>{formatDuration(thread.totalSeconds)}</span><ChevronRight size={15} /></span>
+      <span className="thread-meta"><span>{thread.events.length} signals</span><span>{threadMeasure(thread)}</span><ChevronRight size={15} /></span>
     </button>
   );
 }
@@ -633,7 +729,7 @@ function ActivityPage() {
   const [query, setQuery] = useState("");
   const resource = useResource(() => api.activity(range, query), [range]);
   const filtered = useMemo(
-    () => resource.data?.filter((event) => `${event.appName} ${event.windowTitle} ${event.pageTitle} ${event.topic}`.toLowerCase().includes(query.toLowerCase())),
+    () => resource.data?.filter((event) => `${event.appName} ${event.windowTitle} ${event.pageTitle} ${event.searchQuery} ${event.topic}`.toLowerCase().includes(query.toLowerCase())),
     [resource.data, query],
   );
   return (
@@ -671,7 +767,7 @@ function ActivityList({ events, compact = false }: { events: ActivityEvent[]; co
             <p>{domainFromUrl(event.url) || event.topic || "Application focus"}</p>
           </div>
           <span className={`source-tag ${event.source}`}>{event.source}</span>
-          <strong className="duration">{formatDuration(event.durationSeconds)}</strong>
+          <strong className="duration">{activityMeasure(event)}</strong>
         </article>
       ))}
     </div>
@@ -715,6 +811,16 @@ function ActivityLogo({ event }: { event: ActivityEvent }) {
         : fallback}
     </div>
   );
+}
+
+function activityMeasure(event: ActivityEvent): string {
+  return event.source === "editor" ? "saved" : formatDuration(event.durationSeconds);
+}
+
+function threadMeasure(thread: WorkThread): string {
+  return thread.events.length > 0 && thread.events.every((event) => event.source === "editor")
+    ? `${thread.events.length} saves`
+    : formatDuration(thread.totalSeconds);
 }
 
 function ProfilePage() {
@@ -855,7 +961,6 @@ function AssistantPage() {
   ]);
   const [draft, setDraft] = useState("");
   const [sending, setSending] = useState(false);
-  const [mode, setMode] = useState<ChatMode>("optimized");
   const [economics, setEconomics] = useState<ContextEconomics>();
   const [retrievedMemories, setRetrievedMemories] = useState<MemoryRecord[]>([]);
   const [runIntegration, setRunIntegration] = useState<{ memoryProvider: string; memoryWarning?: string; telemetryStatus: string }>();
@@ -872,7 +977,7 @@ function AssistantPage() {
     setSending(true);
     setError("");
     try {
-      const result = await api.chat(next, mode, activeContextBrief ?? undefined);
+      const result = await api.chat(next, "optimized", activeContextBrief ?? undefined);
       setMessages([...next, result.message]);
       setEconomics(result.economics);
       setRetrievedMemories(result.retrievedMemories);
@@ -892,17 +997,13 @@ function AssistantPage() {
         description="One question shows the full-context baseline, the memories KnowU selected, and the resulting token reduction."
         actions={(
           <div className="assistant-header-actions">
-            <div className="context-mode-switch" aria-label="Answer context mode">
-              <button className={mode === "optimized" ? "selected" : ""} onClick={() => setMode("optimized")}>KnowU Context</button>
-              <button className={mode === "baseline" ? "selected" : ""} onClick={() => setMode("baseline")}>Full Context</button>
-            </div>
             <a className="ghost-button" href="#/dashboard">Back to Now</a>
           </div>
         )}
       />
       <div className="assistant-workspace">
         <section className="chat-shell">
-          <div className="chat-context"><ShieldCheck size={15} /><span>{mode === "optimized" ? "EverOS query-specific memory" : "Full local context baseline"}</span><small>Raw activity never leaves this Mac</small></div>
+          <div className="chat-context"><ShieldCheck size={15} /><span>EverOS memory + compact local activity facts</span><small>Raw logs stay on this Mac</small></div>
           {activeContextBrief && <details className="active-context-preview"><summary>Review high-level thread brief</summary><pre>{activeContextBrief}</pre></details>}
           <div className="message-list">
             {messages.map((message) => (
@@ -977,8 +1078,8 @@ function ContextEconomicsPanel({
         <>
           <div className="economics-hero"><strong>{economics.reductionPercent.toFixed(1)}%</strong><span>fewer input tokens</span></div>
           <div className="economics-grid">
-            <article><span>Full Context</span><strong>{formatTokenCount(economics.baselineInputTokens)}</strong></article>
-            <article className="optimized"><span>KnowU Context</span><strong>{formatTokenCount(economics.optimizedInputTokens)}</strong></article>
+            <article><span>Full Context comparison</span><strong>{formatTokenCount(economics.baselineInputTokens)}</strong></article>
+            <article className="optimized"><span>Answer Context</span><strong>{formatTokenCount(economics.optimizedInputTokens)}</strong></article>
             <article><span>Tokens Saved</span><strong>{formatTokenCount(economics.tokensSaved)}</strong></article>
             <article><span>Memories</span><strong>{economics.memoryCount}</strong></article>
           </div>
@@ -992,14 +1093,14 @@ function ContextEconomicsPanel({
               </article>
             )) : <p>No relevant memories were retrieved for this query.</p>}
           </section>
-          <details className="context-comparison"><summary>Compare context payloads</summary><div><span>Full Context</span><pre>{economics.baselineContextPreview}</pre></div><div><span>KnowU Context</span><pre>{economics.optimizedContextPreview}</pre></div></details>
+          <details className="context-comparison"><summary>Compare context payloads</summary><div><span>Full Context comparison (not sent)</span><pre>{economics.baselineContextPreview}</pre></div><div><span>Answer Context (sent)</span><pre>{economics.optimizedContextPreview}</pre></div></details>
           <div className="telemetry-line"><span className={economics.telemetryStatus === "synced-to-snowflake" ? "status-ok" : "status-warn"}>{economics.telemetryStatus}</span><small>Query {economics.queryId.slice(0, 8)}</small></div>
           {runIntegration?.memoryWarning && <p className="integration-warning">{runIntegration.memoryWarning}</p>}
         </>
       ) : (
         <div className="economics-empty">
           <strong>Ask one question.</strong>
-          <p>KnowU will retrieve relevant memories, answer with the selected mode, and show the measured reduction here.</p>
+          <p>KnowU will answer with compact, query-complete context and compare it with the larger baseline.</p>
         </div>
       )}
       <div className="integration-status">
@@ -1074,7 +1175,7 @@ function SettingsPage() {
             </section>
 
             <section className="panel settings-card">
-              <SettingsHeading icon={<Eye />} title="Collection" detail="Foreground app, window title, and permitted browser metadata." />
+              <SettingsHeading icon={<Eye />} title="Collection" detail="Foreground app, window title, selected Chrome history, and editor file-save metadata." />
               <Toggle label="Collection active" detail="The Chrome companion follows the Mac state on its next status check." checked={settings.collectionStatus.enabled} onChange={(enabled) => api.setCollectionEnabled(enabled).then(resource.setData)} />
               <Toggle label="Behavioral guidance" detail="Break and focus suggestions; work-continuity guidance stays on." checked={settings.behavioralGuidanceEnabled} onChange={(behavioralGuidanceEnabled) => void patch({ behavioralGuidanceEnabled })} />
               <Toggle label="Launch at login" detail="Resume local collection after you sign in." checked={settings.launchAtLogin} onChange={(launchAtLogin) => void patch({ launchAtLogin })} />
@@ -1084,6 +1185,7 @@ function SettingsPage() {
                 {!settings.collectionStatus.accessibilityGranted && <button className="ghost-button" onClick={() => void api.requestAccessibility()}>Open prompt</button>}
               </div>
               {settings.collectionStatus.degradedReasons.map((reason) => <p className="status-detail" key={reason}>{reason}</p>)}
+              <p className="status-detail">While collection is active, KnowU backfills new Chrome visits and reads metadata-only Local History indexes from VS Code, Cursor, and Cortex Code. It never opens saved code snapshots or source contents.</p>
               {settings.collectionStatus.dataPath && <p className="status-detail">Local database: {settings.collectionStatus.dataPath}</p>}
             </section>
 
@@ -1121,7 +1223,7 @@ function SettingsPage() {
                         {historyImporting ? "Re-importing…" : "Re-import Chrome history"}
                       </button>
                     </div>
-                    <p className="status-detail">Reads the last 30 days from selected local Chrome profiles for browsing context and rebuilds your profile. Foreground app time comes from live local collection because Chrome history durations are not reliable screen-time data.</p>
+                    <p className="status-detail">Manual re-import reads the last 30 days and rebuilds your profile. While collection is active, new visits are also backfilled approximately every 30 seconds. Foreground app time still comes from live local collection because Chrome history durations are not reliable screen-time data.</p>
                     {historyImportMessage && (
                       <p className={historyImportError ? "error-message" : "success-message"}>
                         {!historyImportError && <Check size={14} />}

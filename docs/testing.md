@@ -93,9 +93,19 @@ Chrome profile, or live provider accounts. Before an alpha handoff:
     non-production key.
 12. Add a profile correction, refresh, and confirm the correction remains.
 13. Dismiss a recommendation and confirm it leaves the dashboard.
-14. Invoke **Delete everything**, then verify app-owned rows are gone, default
+14. With known Snowflake history imported, ask “How long have I been working on
+    Snowflake?” Confirm the answer separates first-to-last calendar span from
+    de-overlapped live activity time, labels Chrome-history duration as
+    unreliable foreground evidence, and states the local retention limit.
+15. Expand **Compare context payloads**. Confirm KnowU Context contains compact
+    aggregate facts but no URLs, titles, searches, event IDs, or browser-profile
+    IDs, and that it remains smaller than Full Context.
+16. Repeat once with EverOS unavailable and once with Snowflake unavailable.
+    Local activity facts must still answer the question; the UI should label the
+    EverOS fallback and Snowflake telemetry status accurately.
+17. Invoke **Delete everything**, then verify app-owned rows are gone, default
     settings return, old pairing fails, and provider keys are unavailable.
-15. Clear/remove the extension separately and remove the Native Messaging
+18. Clear/remove the extension separately and remove the Native Messaging
     manifest when the test is complete.
 
 ## Inspect local state

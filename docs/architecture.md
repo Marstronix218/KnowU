@@ -13,7 +13,7 @@ token-economics telemetry. Raw personal activity remains local.
 | Component | Location | Responsibility |
 | --- | --- | --- |
 | React/Vite interface | `apps/desktop/src` | Onboarding, dashboard, history, profile, assistant, and settings |
-| Tauri/Rust core | `apps/desktop/src-tauri/src` | IPC commands, collection, Chrome import, retention, context assembly, SQLite, Keychain, scheduling, and provider calls |
+| Tauri/Rust core | `apps/desktop/src-tauri/src` | IPC commands, collection, continuous Chrome backfill, editor-history metadata import, retention, context assembly, SQLite, Keychain, scheduling, and provider calls |
 | Memory service | `apps/desktop/src-tauri/src/memory` | Approved-memory ingestion, EverOS v2 add/flush/search, and safe local fallback |
 | Context builders | `apps/desktop/src-tauri/src/context.rs` | Full-context baseline and query-specific KnowU context |
 | Analytics service | `apps/desktop/src-tauri/src/analytics` | Token measurement provenance and Snowflake SQL API telemetry |
@@ -35,6 +35,7 @@ macOS foreground app/window
       Rust collector ----------------------+
                                             |
 selected Chrome History --> temporary copy  |
+VS Code-family Local History indexes -------+
                                             v
 Chrome tabs --> extension --> local bridge --> SQLite
                                             |
@@ -44,8 +45,10 @@ Chrome tabs --> extension --> local bridge --> SQLite
                                   approved profile facts ----> EverOS
                                             |
 current question --------------------> relevant memory search
+       |                                    |
+       +--> local query-specific facts -----+
                                             |
-                 full baseline + selective context comparison
+                 query-complete answer context
                                             |
                                             v
                                   OpenAI or Anthropic
@@ -54,7 +57,13 @@ current question --------------------> relevant memory search
                                             |
                                             v
                               local inference telemetry ----> Snowflake
+
+larger full-context baseline --> local comparison only
 ```
+
+The production answer path always uses EverOS memories plus compact local facts.
+The larger baseline is not an alternate answer mode; it exists to demonstrate
+the token savings of selective context without omitting answer-critical facts.
 
 The frontend calls typed Tauri commands through `invoke`. It does not open the
 database, read Keychain, or call providers directly. Outside Tauri, the same
@@ -75,6 +84,28 @@ Chrome history import:
 3. Copies each selected `History` database to a uniquely named temporary file.
 4. Reads visits from the previous 90 days.
 5. Deletes the temporary copy after the import attempt.
+
+While collection is active, the Rust core checks selected Chrome `History`
+databases approximately every 30 seconds. When one changes, it repeats a
+deduplicated two-day backfill so new visits appear without another manual
+import. These rows are visit metadata, not reliable active-tab duration.
+
+VS Code-family editor context does not require an extension. Every 30 seconds,
+KnowU checks the Local History indexes for Visual Studio Code, Cursor, and
+Cortex Code. It records the editor, workspace-relative file path, and save
+timestamp for recent files inside known workspaces. It never opens the saved
+snapshot or current source file. Hidden files, common generated/dependency
+trees, and credential/key filenames are excluded.
+
+Work threads are grouped by subject rather than application category. The Rust
+core extracts repeated local anchors from search queries, page/window titles,
+domains, document names, and editor-relative paths. For example, Snowflake
+signals from YouTube, a search page, a document, `app.snowflake.com`, and an
+editor filename receive the same `Snowflake` topic while their original events
+remain separate evidence. This immediate grouping is deterministic and local.
+An optional future LLM refinement should operate only on bounded extracted
+terms, domains, counts, and source types—not raw activity rows—and must fall
+back to these local assignments if the provider is unavailable.
 
 Visits older than 30 days are flagged as temporary bootstrap data. They remain
 until the first profile succeeds, then are deleted.
@@ -139,6 +170,8 @@ first refresh deletes bootstrap activity older than 30 days.
 ## Current implementation boundaries
 
 - Chrome is implemented; Safari and Firefox are not.
+- Extension-free editor context currently reflects Local History saves, not
+  unsaved edits, terminal commands, cursor position, selections, or diagnostics.
 - Native helper registration is not a polished installer flow.
 - Extension exclusions are stored separately; the desktop collection state is
   synchronized on extension status checks.

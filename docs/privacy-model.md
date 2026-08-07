@@ -7,13 +7,26 @@ external boundaries.
 ## Raw local activity
 
 The existing collectors can store foreground app names, permitted window
-titles, timestamps, durations, selected Chrome history metadata, and Chrome
-active-tab metadata. These records live in the local SQLite database and are
-treated as sensitive.
+titles, timestamps, durations, selected Chrome history metadata, Chrome
+active-tab metadata, and metadata-only save signals from supported VS
+Code-family Local History indexes. An editor signal contains the editor,
+workspace-relative file path, and timestamp. These records live in the local
+SQLite database and are treated as sensitive.
 
 KnowU does not intentionally collect page bodies, DOM content, form input,
-keystrokes, clipboard contents, screenshots, audio, or camera data. The Chrome
-extension has no content scripts.
+keystrokes, clipboard contents, screenshots, audio, camera data, source-file
+contents, or editor Local History snapshots. The Chrome extension has no
+content scripts. Editor metadata collection also excludes hidden paths, common
+generated/dependency trees, and credential/key filenames.
+
+The selected thread may show a media preview for a recognized YouTube URL.
+KnowU fetches only that video's public thumbnail from an allowlisted YouTube
+image host and renders it from memory. The YouTube player is not contacted or
+loaded until the user explicitly presses **Play preview**. Generic websites are
+not embedded and their page bodies are not fetched for preview; the user can
+open the original resource explicitly. Thumbnail and playback requests expose
+ordinary network metadata and the selected video ID to YouTube under the
+user's current network and provider policies.
 
 Raw activity rows, complete browser history, window titles, page titles, URLs,
 and search queries are never uploaded to EverOS or written to Snowflake.
@@ -39,16 +52,27 @@ Context Economics UI.
 
 ## AI provider boundary
 
-OpenAI or Anthropic receives the active conversation plus one selected context:
+OpenAI or Anthropic receives the active conversation plus one query-complete
+context:
 
-- **Full Context:** structured profile, user corrections, aggregated activity
-  summary, and optional high-level thread brief.
-- **KnowU Context:** query-specific approved memories from EverOS (or clearly
-  labeled approved local fallback) and optional high-level thread brief.
+- query-specific approved memories from EverOS (or clearly labeled approved
+  local fallback)
+- compact activity facts computed locally, such as matched count, first/last
+  observation, de-overlapped live duration, and source-specific evidence counts
+- an optional high-level thread brief explicitly selected by the user
 
-Neither mode attaches raw activity rows. OpenAI requests set `store: false`.
+The larger Full Context payload is constructed only as an unsent token-economics
+comparison. Neither payload attaches raw activity rows. OpenAI requests set
+`store: false`.
 Provider-side processing and retention remain governed by the user's provider
 account and current provider terms.
+
+When the user explicitly chooses **Ask with context**, the visible thread brief
+contains only the inferred topic, bounded aggregate counts, app names,
+first/last observations, and an explicit duration-quality caveat. Duration is
+omitted because mixed imported-history time is not reliable foreground time.
+Titles, URLs, searches, editor paths, and underlying activity rows are not
+attached.
 
 ## Snowflake boundary
 

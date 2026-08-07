@@ -19,15 +19,20 @@ when most of that context is irrelevant to the current question.
 
 ## The solution
 
-For each question, KnowU builds two real context payloads:
+For each question, KnowU builds two real context payloads while using one
+query-complete answer path:
 
-1. **Full Context** is the baseline: the larger local profile, authoritative
-   corrections, summarized activity, conversation, and optional thread brief.
-2. **KnowU Context** searches EverOS for query-specific approved memories and
-   sends only those memories, the conversation, and optional high-level thread
-   brief.
-3. The selected mode produces the answer through the existing OpenAI or
-   Anthropic BYOK provider path.
+1. **Full Context** is an unsent comparison baseline: the larger local profile,
+   authoritative corrections, summarized activity, conversation, and optional
+   thread brief. It includes the same retrieved memories and query-specific
+   facts as the answer path, making the token comparison answer-equivalent.
+2. **KnowU Context** combines query-specific approved memories from EverOS with
+   compact activity facts computed locally from SQLite. It sends facts such as
+   first/last observation, de-overlapped live activity time, and evidence
+   counts—not raw activity rows.
+3. KnowU Context always produces the answer through the configured OpenAI or
+   Anthropic BYOK provider path. Full Context is comparison-only, so answer
+   correctness never depends on selecting a more expensive mode.
 4. KnowU displays the full/optimized input counts, tokens saved, reduction
    percentage, retrieved memories, model, latency, and telemetry status.
 5. Aggregate inference-run metrics are persisted locally and synced to
@@ -39,6 +44,8 @@ The main demo screen makes the flow visible:
 QUESTION
    ↓
 EVEROS RELEVANT MEMORIES
+   +
+LOCAL QUERY-SPECIFIC FACTS
    ↓
 ANSWER
    +
@@ -50,10 +57,10 @@ FULL CONTEXT vs KNOWU CONTEXT TOKEN SAVINGS
 ```text
 React/Vite UI
   └─ Tauri commands
-      ├─ local SQLite activity/profile store (existing foundation)
+      ├─ local SQLite activity/profile store
       ├─ context builders
       │   ├─ baseline: profile + safe summaries
-      │   └─ optimized: query-specific memories only
+      │   └─ answer: query-specific memories + compact local facts
       ├─ MemoryService
       │   └─ EverOSMemoryService → EverOS Memory API v2
       ├─ OpenAI / Anthropic BYOK provider
@@ -69,15 +76,36 @@ Key implementation locations:
 - `apps/desktop/src-tauri/src/context.rs` — baseline and optimized builders.
 - `apps/desktop/src-tauri/src/analytics/mod.rs` — token measurement and
   Snowflake SQL API telemetry.
-- `apps/desktop/src-tauri/src/commands.rs` — orchestration at the existing chat
-  boundary.
+- `apps/desktop/src-tauri/src/commands.rs` — chat orchestration and context
+  assembly.
 - `apps/desktop/src/App.tsx` — Context Economics, retrieved-memory disclosure,
-  comparison toggle, and memory sync controls.
+  comparison previews, and memory sync controls.
 - `snowflake/setup.sql` — Snowflake table and aggregate view.
 
 The app uses KnowU consistently in its product branding and internal
 identifiers, including the bundle ID, SQLite filename, native-host name, and
 npm workspace scopes.
+
+## Local activity context
+
+While collection is active, KnowU enriches its local timeline from three
+sources:
+
+- macOS foreground application and permitted window-title sessions
+- selected Chrome profile history, automatically backfilled about every 30
+  seconds after the database changes
+- metadata-only Local History save signals from Visual Studio Code, Cursor,
+  and Cortex Code, without requiring an editor extension
+
+The editor collector stores only the editor, workspace-relative path, and save
+timestamp. It never opens source files or saved Local History snapshots. This
+extension-free approach cannot see unsaved edits, terminal commands, cursor
+movement, selections, or diagnostics.
+
+KnowU also groups repeated subjects across those sources. A Snowflake search,
+YouTube tutorial, dashboard, document, and editor path can therefore appear as
+one `Snowflake` work thread with each original event shown as evidence. Obvious
+shared subjects are matched locally; an LLM is not required for this fast path.
 
 ## EverOS integration
 
@@ -114,7 +142,7 @@ memory text into Snowflake.
 
 Each `INFERENCE_RUNS` row contains:
 
-- model and selected mode
+- model and context strategy
 - baseline and optimized input tokens
 - tokens saved and reduction percentage
 - actual provider input/output usage when returned
@@ -142,9 +170,9 @@ External boundaries:
 
 - **EverOS:** approved/derived memories only—profile facts, interests,
   projects, patterns, explicit corrections, and demo seed facts.
-- **AI provider:** the selected baseline or optimized context plus the active
-  conversation. The optimized path contains query-specific approved memories,
-  not raw activity.
+- **AI provider:** the active conversation plus query-specific approved
+  memories and compact locally derived activity facts. Raw activity rows are
+  never attached.
 - **Snowflake:** numeric/aggregate inference telemetry only by default.
 
 Optional Snowflake `AI_COUNT_TOKENS` support is off by default because it would
@@ -173,7 +201,7 @@ per-million-token rates are supplied.
 
 Requirements:
 
-- Apple Silicon Mac (the existing collector's tested target)
+- Apple Silicon Mac (the collector's tested target)
 - Node.js 20.19+ or 22.12+ and npm
 - current stable Rust toolchain
 - Xcode Command Line Tools
@@ -237,23 +265,19 @@ Secrets are ignored by git and must never be committed.
 4. Ask: **“What should I prioritize when building the production version?”**
 5. Show the EverOS memories retrieved, the answer, Full Context tokens, KnowU
    Context tokens, tokens saved, and the reduction percentage.
-6. Expand **Compare context payloads** to show exactly why the optimized prompt
-   is smaller; point out that raw activity is absent.
-7. Switch to **Full Context**, ask the same question, and compare the answer path
-   while the economics panel keeps both measurements visible.
+6. Expand **Compare context payloads** to show exactly why the answer prompt is
+   smaller; point out that it contains compact query-specific facts rather than
+   raw activity.
+7. With Snowflake activity present locally, ask: **“How long have I been working
+   on Snowflake?”** Show that the answer separates calendar span, observed live
+   time, and historical-visit metadata while Full Context remains comparison-only.
 8. Open **Memory → Add correction** and enter: **“Accessibility is more
    important to me than visual polish.”** Save it; KnowU confirms EverOS sync.
 9. Return to the assistant and ask: **“What tradeoff should I make next?”** Show
    the new correction retrieved from EverOS and influencing the answer.
 10. Show `CONTEXT_ECONOMICS_SUMMARY` in Snowflake to verify aggregate telemetry.
 
-## What was built for the hackathon
-
-KnowU builds on an existing local activity/context prototype. The original
-prototype supplied the React/Tauri shell, local SQLite collection, profile
-generation, and provider-backed chat foundation.
-
-Created specifically for this hackathon:
+## KnowU capabilities
 
 - KnowU product identity and “Remembers more. Sends less.” experience
 - vendor-isolated memory service and EverOS v2 persistent integration
@@ -264,5 +288,5 @@ Created specifically for this hackathon:
 - Context Economics UI with retrieved memories and inspectable context payloads
 - graceful missing-credential and integration-failure behavior
 
-Historical local collector and Chrome-pairing documentation remains in `docs/`;
-its paths, identifiers, and examples use the canonical KnowU naming.
+Local collector and Chrome-pairing documentation is available in `docs/`; its
+paths, identifiers, and examples use the canonical KnowU naming.
