@@ -15,6 +15,7 @@ import type {
   Provider,
   RangeKey,
   SettingsData,
+  ThreadContext,
 } from "../types";
 import {
   mockActivity,
@@ -69,6 +70,12 @@ export const api = {
       return;
     }
     await invoke<void>("open_resource", { url });
+  },
+  openApplication: async (appName: string) => {
+    if (!isTauri()) {
+      throw new Error("Opening local applications is only available in the desktop app.");
+    }
+    await invoke<void>("open_application", { appName });
   },
   activityPreview: (url: string) =>
     call<ActivityPreview>("get_activity_preview", { url }, browserPreview(url)),
@@ -157,10 +164,10 @@ export const api = {
     call<SettingsData>("save_settings", { settings }, { ...mockSettings, ...settings }),
   dismissRecommendation: (id: string, feedback?: string) =>
     call<void>("dismiss_recommendation", { id, feedback }, undefined),
-  chat: (messages: ChatMessage[], mode: ChatMode = "optimized", contextBrief?: string) =>
+  chat: (messages: ChatMessage[], mode: ChatMode = "optimized", threadContext?: ThreadContext) =>
     call<ChatRunResult>(
       "chat",
-      { messages, mode, contextBrief },
+      { messages, mode, threadContext },
       {
         message: {
           id: crypto.randomUUID(),
@@ -190,6 +197,12 @@ export const api = {
           outputTokens: 84,
           latencyMs: 620,
           memoryCount: 1,
+          contextBudgetTokens: 6000,
+          contextEstimatedTokens: 721,
+          contextUnitsConsidered: 8,
+          contextUnitsSent: 8,
+          contextUnitsOmitted: 0,
+          contextDetailLevel: "selected-event-metadata",
           measurementMethod: "preview_sample",
           telemetryStatus: "preview-only",
           baselineContextPreview: "Sample full profile and summarized activity context.",

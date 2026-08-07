@@ -10,6 +10,7 @@ import {
   Clock3,
   Copy,
   Eye,
+  FileCode2,
   KeyRound,
   Layers3,
   LayoutDashboard,
@@ -43,6 +44,8 @@ import type {
   Provider,
   RangeKey,
   SettingsData,
+  ThreadContext,
+  ThreadContextEvent,
   UsageSlice,
 } from "./types";
 
@@ -53,6 +56,20 @@ const navigation = [
   { to: "/activity", label: "Activity", icon: Activity },
   { to: "/settings", label: "Settings", icon: Settings },
 ];
+
+const providers: Provider[] = ["openai", "anthropic", "bedrock"];
+
+function providerLabel(provider: Provider): string {
+  if (provider === "openai") return "OpenAI";
+  if (provider === "anthropic") return "Anthropic";
+  return "AWS Bedrock";
+}
+
+function providerKeyPlaceholder(provider: Provider): string {
+  if (provider === "openai") return "sk-…";
+  if (provider === "anthropic") return "sk-ant-…";
+  return "ABSK…";
+}
 
 function App() {
   const [setupComplete, setSetupComplete] = useState(
@@ -160,7 +177,7 @@ function SetupWizard({ onComplete }: { onComplete: () => void }) {
             <div className="setup-icon"><ShieldCheck size={30} /></div>
             <div className="eyebrow">Your context stays yours</div>
             <h1>An assistant that learns from how you actually work.</h1>
-            <p>KnowU observes foreground apps, permitted window titles, and selected browser activity. Raw history stays on this Mac. Only approved memories and minimized context go to external services.</p>
+            <p>KnowU observes foreground apps, permitted window titles, and selected browser activity. Raw history stays on this Mac. When you select a thread, a visible, sanitized detail packet is packed under a token budget for the AI provider.</p>
             <div className="consent-grid">
               <article><LockKeyhole size={18} /><strong>Local raw data</strong><span>SQLite on this Mac, detailed history retained for 30 days.</span></article>
               <article><Eye size={18} /><strong>Visible collection</strong><span>Pause, exclude, inspect, edit, or delete at any time.</span></article>
@@ -213,9 +230,9 @@ function SetupWizard({ onComplete }: { onComplete: () => void }) {
             <h1>Connect an AI provider.</h1>
             <p>Your key is stored in macOS Keychain. Provider calls originate in the native core, never the browser extension or React interface.</p>
             <div className="provider-tabs">
-              {(["openai", "anthropic"] as Provider[]).map((item) => <button className={provider === item ? "selected" : ""} key={item} onClick={() => setProvider(item)}>{item === "openai" ? "OpenAI" : "Anthropic"}</button>)}
+              {providers.map((item) => <button className={provider === item ? "selected" : ""} key={item} onClick={() => setProvider(item)}>{providerLabel(item)}</button>)}
             </div>
-            <label className="secret-field">API key<input type="password" value={providerKey} onChange={(event) => setProviderKey(event.target.value)} placeholder={provider === "openai" ? "sk-…" : "sk-ant-…"} /></label>
+            <label className="secret-field">API key<input type="password" value={providerKey} onChange={(event) => setProviderKey(event.target.value)} placeholder={providerKeyPlaceholder(provider)} /></label>
             {message && <p className="error-message">{message}</p>}
           </div>
         )}
@@ -382,9 +399,15 @@ function toThreadId(value: string): string {
 
 function deriveThreads(data: DashboardData): WorkThread[] {
   const groups = new Map<string, ActivityEvent[]>();
+  const softwareDevelopmentTopic = data.activeTopics.find(
+    (topic) => topic.name.toLocaleLowerCase() === "software development",
+  )?.name;
   data.recentActivity.forEach((event) => {
     const title = event.topic?.trim() || event.appName;
     groups.set(title, [...(groups.get(title) ?? []), event]);
+    if (event.source === "editor" && softwareDevelopmentTopic && title !== softwareDevelopmentTopic) {
+      groups.set(softwareDevelopmentTopic, [...(groups.get(softwareDevelopmentTopic) ?? []), event]);
+    }
   });
   data.activeTopics.forEach((topic) => {
     if (!groups.has(topic.name)) groups.set(topic.name, []);
@@ -416,18 +439,93 @@ function deriveThreads(data: DashboardData): WorkThread[] {
   }).sort((a, b) => (Date.parse(b.lastActiveAt ?? "") || 0) - (Date.parse(a.lastActiveAt ?? "") || 0));
 }
 
-function makeContextBrief(thread: WorkThread): string {
-  const apps = [...new Set(thread.events.map((event) => event.appName))].slice(0, 3);
-  const oldest = thread.events[thread.events.length - 1]?.startedAt;
+function contextResource(event: ActivityEvent): string | undefined {
+  if (event.url) {
+    try {
+      const url = new URL(event.url);
+      if ((url.protocol === "http:" || url.protocol === "https:") && url.hostname && !url.username && !url.password) {
+        const path = url.pathname === "/" ? "" : url.pathname;
+        return `${url.hostname.replace(/^www\./, "")}${path}`.slice(0, 240);
+      }
+    } catch {
+      // Fall through to metadata-only resources.
+    }
+  }
+  return event.source === "editor" ? editorFilePath(event)?.slice(0, 240) : undefined;
+}
+
+function reopenableWebUrl(value?: string): string | undefined {
+  if (!value) return undefined;
+  const candidate = value.trim();
+  try {
+    const parsed = new URL(candidate);
+    if (
+      (parsed.protocol !== "http:" && parsed.protocol !== "https:")
+      || !parsed.hostname
+      || parsed.username
+      || parsed.password
+    ) {
+      return undefined;
+    }
+    return candidate;
+  } catch {
+    return undefined;
+  }
+}
+
+function makeThreadContext(thread: WorkThread): ThreadContext {
+  const events: ThreadContextEvent[] = thread.events.slice(0, 100).map((event) => ({
+    observedAt: event.startedAt,
+    appName: event.appName.slice(0, 100),
+    source: event.source,
+    title: (event.pageTitle || event.windowTitle)?.trim().slice(0, 300) || undefined,
+    resource: contextResource(event),
+    searchQuery: event.searchQuery?.trim().slice(0, 300) || undefined,
+    observedActiveSeconds: event.source === "history" || event.source === "editor"
+      ? undefined
+      : Math.max(0, event.durationSeconds),
+  }));
+  return {
+    version: 1,
+    subject: thread.title,
+    signalCount: thread.events.length,
+    apps: [...new Set(thread.events.map((event) => event.appName))].slice(0, 12),
+    observedFrom: thread.events[thread.events.length - 1]?.startedAt,
+    observedThrough: thread.lastActiveAt,
+    events,
+  };
+}
+
+function makeContextBrief(context: ThreadContext): string {
   return [
-    `Context brief: ${thread.title}`,
-    `${thread.events.length} locally observed signals${apps.length ? ` across ${apps.join(", ")}` : ""}.`,
-    oldest && thread.lastActiveAt
-      ? `Observed from ${formatContextDateTime(oldest)} through ${formatContextDateTime(thread.lastActiveAt)}.`
+    `Context packet: ${context.subject}`,
+    `${context.signalCount} locally observed signals${context.apps.length ? ` across ${context.apps.join(", ")}` : ""}.`,
+    context.observedFrom && context.observedThrough
+      ? `Observed from ${formatContextDateTime(context.observedFrom)} through ${formatContextDateTime(context.observedThrough)}.`
       : "No detailed timing evidence is available in this range.",
-    "Duration is omitted here because imported browser-history time is not reliable foreground time. Detailed titles, URLs, searches, and event rows remain local.",
-    "Treat this as provisional behavioral context, not confirmed user intent.",
+    "Selected evidence candidates (the native core ranks these under the configured token budget):",
+    ...context.events.map((event) => [
+      `- ${formatContextDateTime(event.observedAt)} | ${event.source} | ${event.appName}`,
+      event.title,
+      event.resource && `resource=${event.resource}`,
+      event.searchQuery && `search=${event.searchQuery}`,
+      event.observedActiveSeconds !== undefined && `observed-active=${event.observedActiveSeconds}s`,
+    ].filter(Boolean).join(" | ")),
+    "The selected thread subject is used for approved-memory retrieval. Event details go to the selected AI provider and, only if optional Snowflake AI token counting is enabled, to Snowflake for counting.",
+    "Browser-history duration remains excluded because it is not reliable foreground time. Treat metadata as provisional evidence, not confirmed intent or completion.",
   ].join("\n\n");
+}
+
+function loadThreadContext(): ThreadContext | undefined {
+  const serialized = sessionStorage.getItem("knowu.active-thread-context");
+  if (!serialized) return undefined;
+  try {
+    const value = JSON.parse(serialized) as Partial<ThreadContext>;
+    if (value.version !== 1 || !value.subject || !Array.isArray(value.events)) return undefined;
+    return value as ThreadContext;
+  } catch {
+    return undefined;
+  }
 }
 
 function formatContextDateTime(value: string): string {
@@ -455,7 +553,9 @@ function DashboardContent({ data }: { data: DashboardData }) {
     setActionMessage("");
   };
   const resume = async () => {
-    const target = selected.events.find((event) => event.url)?.url;
+    const target = selected.events
+      .map((event) => reopenableWebUrl(event.url))
+      .find((url): url is string => Boolean(url));
     if (target) {
       setActionMessage("Opening the latest available resource…");
       try {
@@ -464,15 +564,36 @@ function DashboardContent({ data }: { data: DashboardData }) {
       } catch {
         setActionMessage("Could not open the latest available resource.");
       }
-    } else {
-      setActionMessage("No reopenable web resource is available. The context brief is ready to use.");
+      return;
+    }
+
+    const appName = selected.events
+      .map((event) => event.appName.trim())
+      .find((name) => {
+        const normalized = name.toLocaleLowerCase();
+        return Boolean(name) && normalized !== "unknown" && normalized !== "knowu";
+      });
+    if (!appName) {
+      setActionMessage("No reopenable resource or local application is available. The context brief is ready to use.");
+      return;
+    }
+
+    setActionMessage(`Opening ${appName}…`);
+    try {
+      await api.openApplication(appName);
+      setActionMessage(`Opened ${appName}.`);
+    } catch {
+      setActionMessage(`Could not open ${appName}.`);
     }
   };
   const copyBrief = async () => {
-    await navigator.clipboard.writeText(makeContextBrief(selected));
-    setActionMessage("Context brief copied.");
+    await navigator.clipboard.writeText(makeContextBrief(makeThreadContext(selected)));
+    setActionMessage("Detailed context packet copied.");
   };
-  const prepareAssistant = () => sessionStorage.setItem("knowu.active-context-brief", makeContextBrief(selected));
+  const prepareAssistant = () => sessionStorage.setItem(
+    "knowu.active-thread-context",
+    JSON.stringify(makeThreadContext(selected)),
+  );
 
   return (
     <>
@@ -664,15 +785,22 @@ function EvidenceRail({ events, previewEvent }: { events: ActivityEvent[]; previ
   return (
     <div className="evidence-rail">
       {previewEvent && <ActivityPreviewCard event={previewEvent} />}
+      <EditorChangeSummary events={events} />
       <div className="evidence-heading"><Eye size={16} /><span>Why this thread?</span><small>Observed locally</small></div>
-      {events.length ? events.slice(0, previewEvent ? 3 : 4).map((event, index) => (
-        <article key={event.id}>
-          <span className="evidence-index">{String(index + 1).padStart(2, "0")}</span>
-          <ActivityLogo event={event} />
-          <div><strong>{event.pageTitle || event.windowTitle || event.appName}</strong><small>{domainFromUrl(event.url) || event.appName} · {formatTime(event.startedAt)}</small></div>
-          <time>{activityMeasure(event)}</time>
-        </article>
-      )) : <p className="evidence-empty">This topic is inferred from aggregate signals; no detailed event is available in this range.</p>}
+      {events.length ? events.slice(0, previewEvent ? 3 : 4).map((event, index) => {
+        const appContext = codeActivityContext(event, events);
+        return (
+          <article key={event.id}>
+            <span className="evidence-index">{String(index + 1).padStart(2, "0")}</span>
+            <ActivityLogo event={event} />
+            <div>
+              <strong>{event.pageTitle || event.windowTitle || event.appName}</strong>
+              <small title={appContext?.title}>{domainFromUrl(event.url) || event.appName}{appContext ? ` · ${appContext.label}` : ""} · {formatTime(event.startedAt)}</small>
+            </div>
+            <time>{activityMeasure(event)}</time>
+          </article>
+        );
+      }) : <p className="evidence-empty">This topic is inferred from aggregate signals; no detailed event is available in this range.</p>}
     </div>
   );
 }
@@ -745,6 +873,7 @@ function ActivityPage() {
         <span className="fact-badge"><LockKeyhole size={14} /> Stored locally for 30 days</span>
       </div>
       <section className="panel activity-panel">
+        <EditorChangeSummary events={filtered ?? []} />
         <ResourceState {...resource}>
           {() => <ActivityList events={filtered ?? []} />}
         </ResourceState>
@@ -757,20 +886,155 @@ function ActivityList({ events, compact = false }: { events: ActivityEvent[]; co
   if (!events.length) return <EmptyState title="No matching activity" detail="Try a broader filter or another time range." />;
   return (
     <div className={`activity-list ${compact ? "compact" : ""}`}>
-      {events.map((event) => (
-        <article className="activity-row" key={event.id}>
-          <time>{formatTime(event.startedAt)}</time>
-          <div className="timeline-marker" />
-          <ActivityLogo event={event} />
-          <div className="activity-copy">
-            <div><strong>{event.pageTitle || event.windowTitle || event.appName}</strong><span>{event.appName}</span></div>
-            <p>{domainFromUrl(event.url) || event.topic || "Application focus"}</p>
-          </div>
-          <span className={`source-tag ${event.source}`}>{event.source}</span>
-          <strong className="duration">{activityMeasure(event)}</strong>
-        </article>
-      ))}
+      {events.map((event) => {
+        const appContext = codeActivityContext(event, events);
+        return (
+          <article className="activity-row" key={event.id}>
+            <time>{formatTime(event.startedAt)}</time>
+            <div className="timeline-marker" />
+            <ActivityLogo event={event} />
+            <div className="activity-copy">
+              <div>
+                <strong>{editorFilePath(event) || event.pageTitle || event.windowTitle || event.appName}</strong>
+                <span title={appContext?.title}>{event.appName}{appContext ? ` · ${appContext.label}` : ""}</span>
+              </div>
+              <p>{event.source === "editor" ? `${event.topic || "Editor history"} · File save metadata` : domainFromUrl(event.url) || event.topic || "Application focus"}</p>
+            </div>
+            <span className={`source-tag ${event.source}`}>{event.source === "editor" ? "file save" : event.source}</span>
+            <strong className="duration">{activityMeasure(event)}</strong>
+          </article>
+        );
+      })}
     </div>
+  );
+}
+
+interface EditorFileChange {
+  path: string;
+  saves: number;
+  lastSavedAt: string;
+}
+
+interface CodeActivityContext {
+  label: string;
+  title: string;
+}
+
+const CODE_APP_NAMES = new Set(["code", "visual studio code", "cursor", "cortex code", "xcode"]);
+const CODE_FILE_PATTERN = /\.(?:[cm]?[jt]sx?|py|rs|go|java|kt|kts|swift|rb|php|cs|c|cc|cpp|h|hpp|html?|css|scss|sass|less|vue|svelte|sql|sh|bash|zsh|fish|ya?ml|json|toml|xml|graphql|proto)$/i;
+
+function normalizedEditorName(appName: string): string | undefined {
+  const normalized = appName.trim().toLocaleLowerCase();
+  if (!CODE_APP_NAMES.has(normalized)) return undefined;
+  return normalized === "code" || normalized === "visual studio code" ? "visual studio code" : normalized;
+}
+
+function codeFileFromWindow(event: ActivityEvent): string | undefined {
+  if (!normalizedEditorName(event.appName)) return undefined;
+  const candidates = [event.pageTitle, ...(event.windowTitle?.split(/\s+[—–-]\s+/) ?? [])];
+  return candidates
+    .map((value) => value?.trim().replace(/^[●*]\s*/, ""))
+    .find((value): value is string => typeof value === "string" && CODE_FILE_PATTERN.test(value));
+}
+
+function codeFileName(path: string): string {
+  return path.split(/[\\/]/).filter(Boolean).pop() || path;
+}
+
+function codeActivityContext(event: ActivityEvent, events: ActivityEvent[]): CodeActivityContext | undefined {
+  const editorName = normalizedEditorName(event.appName);
+  if (!editorName && event.source !== "editor") return undefined;
+
+  const directFile = editorFilePath(event);
+  let modifiedFiles = directFile ? [directFile] : [];
+  if (!directFile && editorName) {
+    const startedAt = Date.parse(event.startedAt);
+    const endedAt = startedAt + Math.max(event.durationSeconds, 0) * 1_000;
+    modifiedFiles = events.flatMap((candidate) => {
+      if (candidate.source !== "editor" || normalizedEditorName(candidate.appName) !== editorName) return [];
+      const savedAt = Date.parse(candidate.startedAt);
+      return savedAt >= startedAt - 60_000 && savedAt <= endedAt + 60_000
+        ? editorFilePath(candidate) ?? []
+        : [];
+    });
+  }
+
+  const uniqueFiles = [...new Map(modifiedFiles.map((path) => [path.toLocaleLowerCase(), path])).values()];
+  if (uniqueFiles.length) {
+    const names = uniqueFiles.slice(0, 2).map(codeFileName).join(", ");
+    const overflow = uniqueFiles.length > 2 ? ` +${uniqueFiles.length - 2} more` : "";
+    return {
+      label: `Modified ${names}${overflow}`,
+      title: `Modified ${uniqueFiles.join(", ")}`,
+    };
+  }
+
+  const workspaceFiles = [...new Map(
+    (event.modifiedFiles ?? []).map((path) => [path.toLocaleLowerCase(), path]),
+  ).values()];
+  if (workspaceFiles.length) {
+    const names = workspaceFiles.slice(0, 2).map(codeFileName).join(", ");
+    const overflow = workspaceFiles.length > 2 ? ` +${workspaceFiles.length - 2} more` : "";
+    return {
+      label: `Changed ${names}${overflow}`,
+      title: `Recent workspace changes: ${workspaceFiles.join(", ")}`,
+    };
+  }
+
+  const visibleFile = codeFileFromWindow(event);
+  return visibleFile
+    ? { label: `Open ${codeFileName(visibleFile)}`, title: `Visible file: ${visibleFile}; no save detected` }
+    : undefined;
+}
+
+function editorFilePath(event: ActivityEvent): string | undefined {
+  if (event.source !== "editor") return undefined;
+  const pageTitle = event.pageTitle?.trim();
+  if (pageTitle) return pageTitle;
+  const windowTitle = event.windowTitle?.trim();
+  if (!windowTitle) return undefined;
+  const separator = windowTitle.indexOf(" — ");
+  return separator >= 0 ? windowTitle.slice(separator + 3).trim() || undefined : undefined;
+}
+
+function summarizeEditorChanges(events: ActivityEvent[]): EditorFileChange[] {
+  const files = new Map<string, EditorFileChange>();
+  events.forEach((event) => {
+    const path = editorFilePath(event);
+    if (!path) return;
+    const key = path.toLocaleLowerCase();
+    const existing = files.get(key);
+    if (!existing) {
+      files.set(key, { path, saves: 1, lastSavedAt: event.startedAt });
+      return;
+    }
+    existing.saves += 1;
+    if (Date.parse(event.startedAt) > Date.parse(existing.lastSavedAt)) existing.lastSavedAt = event.startedAt;
+  });
+  return [...files.values()].sort((a, b) => Date.parse(b.lastSavedAt) - Date.parse(a.lastSavedAt));
+}
+
+function EditorChangeSummary({ events }: { events: ActivityEvent[] }) {
+  const files = summarizeEditorChanges(events);
+  if (!files.length) return null;
+  const saveCount = files.reduce((total, file) => total + file.saves, 0);
+  return (
+    <section className="editor-change-summary" aria-label="Saved files">
+      <div className="editor-change-heading">
+        <FileCode2 size={17} />
+        <span><strong>Saved files</strong><small>{files.length} file{files.length === 1 ? "" : "s"} · {saveCount} save{saveCount === 1 ? "" : "s"}</small></span>
+      </div>
+      <div className="editor-file-list">
+        {files.slice(0, 6).map((file) => (
+          <div className="editor-file-row" key={file.path}>
+            <code title={file.path}>{file.path}</code>
+            <small>{file.saves} save{file.saves === 1 ? "" : "s"} · {formatTime(file.lastSavedAt)}</small>
+          </div>
+        ))}
+      </div>
+      {files.length > 6 && <small className="editor-file-overflow">+{files.length - 6} more file{files.length - 6 === 1 ? "" : "s"}</small>}
+      <p>File paths and save times only. KnowU does not read code or compute line diffs.</p>
+    </section>
   );
 }
 
@@ -947,7 +1211,8 @@ function ProfilePage() {
 }
 
 function AssistantPage() {
-  const activeContextBrief = sessionStorage.getItem("knowu.active-context-brief");
+  const activeThreadContext = loadThreadContext();
+  const activeContextBrief = activeThreadContext ? makeContextBrief(activeThreadContext) : undefined;
   const integration = useResource(() => api.integrationStatus(), []);
   const [messages, setMessages] = useState<ChatMessage[]>([
     {
@@ -977,7 +1242,7 @@ function AssistantPage() {
     setSending(true);
     setError("");
     try {
-      const result = await api.chat(next, "optimized", activeContextBrief ?? undefined);
+      const result = await api.chat(next, "optimized", activeThreadContext);
       setMessages([...next, result.message]);
       setEconomics(result.economics);
       setRetrievedMemories(result.retrievedMemories);
@@ -1003,8 +1268,8 @@ function AssistantPage() {
       />
       <div className="assistant-workspace">
         <section className="chat-shell">
-          <div className="chat-context"><ShieldCheck size={15} /><span>EverOS memory + compact local activity facts</span><small>Raw logs stay on this Mac</small></div>
-          {activeContextBrief && <details className="active-context-preview"><summary>Review high-level thread brief</summary><pre>{activeContextBrief}</pre></details>}
+          <div className="chat-context"><ShieldCheck size={15} /><span>EverOS memory + token-budgeted selected evidence</span><small>Full raw logs stay on this Mac</small></div>
+          {activeContextBrief && <details className="active-context-preview"><summary>Review local candidate evidence</summary><pre>{activeContextBrief}</pre></details>}
           <div className="message-list">
             {messages.map((message) => (
               <article className={`message ${message.role}`} key={message.id}>
@@ -1024,6 +1289,7 @@ function AssistantPage() {
           {error && <p className="assistant-error error-message">{error}</p>}
           <form className="chat-composer" onSubmit={(event) => void submit(event)}>
             <textarea
+              maxLength={4000}
               value={draft}
               onChange={(event) => setDraft(event.target.value)}
               onKeyDown={(event: ReactKeyboardEvent<HTMLTextAreaElement>) => {
@@ -1079,9 +1345,13 @@ function ContextEconomicsPanel({
           <div className="economics-hero"><strong>{economics.reductionPercent.toFixed(1)}%</strong><span>fewer input tokens</span></div>
           <div className="economics-grid">
             <article><span>Full Context comparison</span><strong>{formatTokenCount(economics.baselineInputTokens)}</strong></article>
-            <article className="optimized"><span>Answer Context</span><strong>{formatTokenCount(economics.optimizedInputTokens)}</strong></article>
+            <article className="optimized"><span>Packed prompt</span><strong>{formatTokenCount(economics.optimizedInputTokens)}</strong></article>
             <article><span>Tokens Saved</span><strong>{formatTokenCount(economics.tokensSaved)}</strong></article>
             <article><span>Memories</span><strong>{economics.memoryCount}</strong></article>
+            <article><span>Context units</span><strong>{economics.contextUnitsSent}/{economics.contextUnitsConsidered}</strong></article>
+            <article><span>Context budget</span><strong>{formatTokenCount(economics.contextEstimatedTokens)}/{formatTokenCount(economics.contextBudgetTokens)}</strong></article>
+            <article><span>Cache read</span><strong>{formatTokenCount(economics.cacheReadInputTokens ?? 0)}</strong></article>
+            <article><span>Detail level</span><strong>{economics.contextDetailLevel.replace(/-/g, " ")}</strong></article>
           </div>
           <div className="run-meta"><span>{economics.model}</span><span>{economics.latencyMs.toLocaleString()} ms</span><span>{economics.measurementMethod.replace(/_/g, " ")}</span></div>
           <section className="remembered-list">
@@ -1093,14 +1363,14 @@ function ContextEconomicsPanel({
               </article>
             )) : <p>No relevant memories were retrieved for this query.</p>}
           </section>
-          <details className="context-comparison"><summary>Compare context payloads</summary><div><span>Full Context comparison (not sent)</span><pre>{economics.baselineContextPreview}</pre></div><div><span>Answer Context (sent)</span><pre>{economics.optimizedContextPreview}</pre></div></details>
+          <details className="context-comparison"><summary>Compare context payloads</summary><div><span>Full Context comparison</span><small>Not sent to the AI provider. Optional Snowflake AI token counting may receive it.</small><pre>{economics.baselineContextPreview}</pre></div><div><span>System context (sent)</span><small>The bounded conversation and current question are sent separately.</small><pre>{economics.optimizedContextPreview}</pre></div></details>
           <div className="telemetry-line"><span className={economics.telemetryStatus === "synced-to-snowflake" ? "status-ok" : "status-warn"}>{economics.telemetryStatus}</span><small>Query {economics.queryId.slice(0, 8)}</small></div>
           {runIntegration?.memoryWarning && <p className="integration-warning">{runIntegration.memoryWarning}</p>}
         </>
       ) : (
         <div className="economics-empty">
           <strong>Ask one question.</strong>
-          <p>KnowU will answer with compact, query-complete context and compare it with the larger baseline.</p>
+              <p>KnowU will pack the richest relevant context that fits the configured token budget and compare it with the larger baseline.</p>
         </div>
       )}
       <div className="integration-status">
@@ -1157,11 +1427,11 @@ function SettingsPage() {
           <div className="settings-grid">
             <section className="panel settings-card">
               <SettingsHeading icon={<KeyRound />} title="AI provider" detail="Your key goes directly from this Mac to the selected provider." />
-              <p className="status-detail">Profile digests and chat are sent only when needed. OpenAI requests disable optional storage; both providers may retain API data under your account and their current policies.</p>
+              <p className="status-detail">Profile digests and chat are sent only when needed. OpenAI disables optional storage. AWS Bedrock uses model-specific token preflight and eligible prompt caching; provider processing remains governed by your account policy.</p>
               <div className="provider-tabs">
-                {(["openai", "anthropic"] as Provider[]).map((provider) => (
+                {providers.map((provider) => (
                   <button className={settings.provider === provider ? "selected" : ""} key={provider} onClick={() => void patch({ provider })}>
-                    {provider === "openai" ? "OpenAI" : "Anthropic"}
+                    {providerLabel(provider)}
                   </button>
                 ))}
               </div>
@@ -1175,7 +1445,7 @@ function SettingsPage() {
             </section>
 
             <section className="panel settings-card">
-              <SettingsHeading icon={<Eye />} title="Collection" detail="Foreground app, window title, selected Chrome history, and editor file-save metadata." />
+              <SettingsHeading icon={<Eye />} title="Collection" detail="Foreground app, window title, selected Chrome history, and editor workspace-change metadata." />
               <Toggle label="Collection active" detail="The Chrome companion follows the Mac state on its next status check." checked={settings.collectionStatus.enabled} onChange={(enabled) => api.setCollectionEnabled(enabled).then(resource.setData)} />
               <Toggle label="Behavioral guidance" detail="Break and focus suggestions; work-continuity guidance stays on." checked={settings.behavioralGuidanceEnabled} onChange={(behavioralGuidanceEnabled) => void patch({ behavioralGuidanceEnabled })} />
               <Toggle label="Launch at login" detail="Resume local collection after you sign in." checked={settings.launchAtLogin} onChange={(launchAtLogin) => void patch({ launchAtLogin })} />
@@ -1185,7 +1455,7 @@ function SettingsPage() {
                 {!settings.collectionStatus.accessibilityGranted && <button className="ghost-button" onClick={() => void api.requestAccessibility()}>Open prompt</button>}
               </div>
               {settings.collectionStatus.degradedReasons.map((reason) => <p className="status-detail" key={reason}>{reason}</p>)}
-              <p className="status-detail">While collection is active, KnowU backfills new Chrome visits and reads metadata-only Local History indexes from VS Code, Cursor, and Cortex Code. It never opens saved code snapshots or source contents.</p>
+              <p className="status-detail">While collection is active, KnowU backfills new Chrome visits and reads metadata-only Local History indexes and Git working-tree paths from VS Code, Cursor, and Cortex Code workspaces. It never opens saved code snapshots or source contents.</p>
               {settings.collectionStatus.dataPath && <p className="status-detail">Local database: {settings.collectionStatus.dataPath}</p>}
             </section>
 

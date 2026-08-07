@@ -62,7 +62,7 @@ the active development process.
 
 ## BYOK provider setup
 
-Choose OpenAI or Anthropic in onboarding or Settings and paste an API key. Save
+Choose OpenAI, Anthropic, or Amazon Bedrock in onboarding or Settings and paste an API key. Save
 stores the key in macOS Keychain; **Test connection** makes a direct request to
 the selected provider.
 
@@ -71,6 +71,8 @@ session can override its Keychain credential through the environment:
 
 ```sh
 ANTHROPIC_API_KEY="your-key" npm run dev:desktop
+# or
+AWS_BEDROCK_API_KEY="your-key" AWS_BEDROCK_REGION="us-east-1" npm run dev:desktop
 ```
 
 An environment value takes precedence over Keychain, but it does not configure

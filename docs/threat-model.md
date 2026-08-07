@@ -18,7 +18,7 @@ provider.
 - detailed browsing and foreground-application history
 - window and page titles, URLs, and extracted search queries
 - generated profile, recommendations, and user corrections
-- OpenAI or Anthropic API key
+- OpenAI, Anthropic, or Amazon Bedrock API key
 - extension pairing token and unfinished active-tab session
 
 ## Trust boundaries
@@ -82,7 +82,9 @@ The provider sees all data described in [Privacy model](privacy-model.md).
 Prompts reduce harmful inference but cannot guarantee a provider will follow
 them or return valid structured data. Provider compromise, account retention,
 abuse monitoring, and legal disclosure are outside the local application's
-control.
+control. Bedrock prompt caching can retain an eligible selected-context prefix
+for the provider-documented cache TTL; users can disable it with
+`AWS_BEDROCK_ENABLE_PROMPT_CACHE=false`.
 
 ### Deletion limits
 

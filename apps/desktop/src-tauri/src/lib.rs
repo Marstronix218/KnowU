@@ -91,6 +91,7 @@ pub fn run() {
             commands::get_activity_icon,
             commands::get_activity_preview,
             commands::open_resource,
+            commands::open_application,
             commands::get_profile,
             commands::get_settings,
             commands::get_browser_profiles,

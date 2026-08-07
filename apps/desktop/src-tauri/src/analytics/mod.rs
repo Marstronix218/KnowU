@@ -40,6 +40,15 @@ pub struct InferenceRun {
     pub reduction_percent: f64,
     pub actual_input_tokens: Option<i64>,
     pub output_tokens: Option<i64>,
+    pub context_budget_tokens: i64,
+    pub context_estimated_tokens: i64,
+    pub context_units_considered: i64,
+    pub context_units_sent: i64,
+    pub context_units_omitted: i64,
+    pub context_detail_level: String,
+    pub provider_preflight_input_tokens: Option<i64>,
+    pub cache_read_input_tokens: Option<i64>,
+    pub cache_write_input_tokens: Option<i64>,
     pub latency_ms: i64,
     pub estimated_cost_usd: Option<f64>,
     pub memory_count: i64,
@@ -157,7 +166,7 @@ impl SnowflakeAnalyticsService {
 
     pub async fn record_inference_run(&self, run: &InferenceRun) -> AppResult<()> {
         self.execute(
-            "INSERT INTO INFERENCE_RUNS (ID, TIMESTAMP, MODEL, BASELINE_INPUT_TOKENS, OPTIMIZED_INPUT_TOKENS, TOKENS_SAVED, REDUCTION_PERCENT, ACTUAL_INPUT_TOKENS, OUTPUT_TOKENS, LATENCY_MS, ESTIMATED_COST_USD, MEMORY_COUNT, MODE, MEMORY_PROVIDER, MEASUREMENT_METHOD) SELECT ?, TO_TIMESTAMP_TZ(?), ?, ?::NUMBER, ?::NUMBER, ?::NUMBER, ?::FLOAT, TRY_TO_NUMBER(?), TRY_TO_NUMBER(?), ?::NUMBER, TRY_TO_DOUBLE(?), ?::NUMBER, ?, ?, ?",
+            "INSERT INTO INFERENCE_RUNS (ID, TIMESTAMP, MODEL, BASELINE_INPUT_TOKENS, OPTIMIZED_INPUT_TOKENS, TOKENS_SAVED, REDUCTION_PERCENT, ACTUAL_INPUT_TOKENS, OUTPUT_TOKENS, CONTEXT_BUDGET_TOKENS, CONTEXT_ESTIMATED_TOKENS, CONTEXT_UNITS_CONSIDERED, CONTEXT_UNITS_SENT, CONTEXT_UNITS_OMITTED, CONTEXT_DETAIL_LEVEL, PROVIDER_PREFLIGHT_INPUT_TOKENS, CACHE_READ_INPUT_TOKENS, CACHE_WRITE_INPUT_TOKENS, LATENCY_MS, ESTIMATED_COST_USD, MEMORY_COUNT, MODE, MEMORY_PROVIDER, MEASUREMENT_METHOD) SELECT ?, TO_TIMESTAMP_TZ(?), ?, ?::NUMBER, ?::NUMBER, ?::NUMBER, ?::FLOAT, TRY_TO_NUMBER(?), TRY_TO_NUMBER(?), ?::NUMBER, ?::NUMBER, ?::NUMBER, ?::NUMBER, ?::NUMBER, ?, TRY_TO_NUMBER(?), TRY_TO_NUMBER(?), TRY_TO_NUMBER(?), ?::NUMBER, TRY_TO_DOUBLE(?), ?::NUMBER, ?, ?, ?",
             vec![
                 binding("TEXT", &run.id),
                 binding("TEXT", &run.timestamp),
@@ -168,6 +177,18 @@ impl SnowflakeAnalyticsService {
                 binding("TEXT", &run.reduction_percent.to_string()),
                 binding("TEXT", &optional_number(run.actual_input_tokens)),
                 binding("TEXT", &optional_number(run.output_tokens)),
+                binding("TEXT", &run.context_budget_tokens.to_string()),
+                binding("TEXT", &run.context_estimated_tokens.to_string()),
+                binding("TEXT", &run.context_units_considered.to_string()),
+                binding("TEXT", &run.context_units_sent.to_string()),
+                binding("TEXT", &run.context_units_omitted.to_string()),
+                binding("TEXT", &run.context_detail_level),
+                binding(
+                    "TEXT",
+                    &optional_number(run.provider_preflight_input_tokens),
+                ),
+                binding("TEXT", &optional_number(run.cache_read_input_tokens)),
+                binding("TEXT", &optional_number(run.cache_write_input_tokens)),
                 binding("TEXT", &run.latency_ms.to_string()),
                 binding("TEXT", &run.estimated_cost_usd.map(|value| value.to_string()).unwrap_or_default()),
                 binding("TEXT", &run.memory_count.to_string()),
@@ -263,19 +284,49 @@ pub fn provider_scaled_measurement(
 }
 
 pub fn estimated_tokens(value: &str) -> i64 {
-    let characters = value.chars().count() as i64;
-    ((characters + 3) / 4).max(1)
+    // Approximate prose compactly while reserving more room for code, dense
+    // punctuation, emoji, and non-Latin scripts. Provider tokenizers differ;
+    // Bedrock additionally enforces its exact CountTokens preflight.
+    let mut prose_chars = 0_i64;
+    let mut dense_chars = 0_i64;
+    for character in value.chars() {
+        if character.is_ascii_alphanumeric() || character.is_ascii_whitespace() {
+            prose_chars += 1;
+        } else if character.is_ascii() {
+            dense_chars += 1;
+        } else {
+            dense_chars += 2;
+        }
+    }
+    (((prose_chars + 3) / 4) + ((dense_chars + 1) / 2)).max(1)
 }
 
-pub fn estimated_cost_usd(input_tokens: Option<i64>, output_tokens: Option<i64>) -> Option<f64> {
+pub fn estimated_cost_usd(
+    input_tokens: Option<i64>,
+    output_tokens: Option<i64>,
+    cache_read_input_tokens: Option<i64>,
+    cache_write_input_tokens: Option<i64>,
+) -> Option<f64> {
     let input_rate = non_empty_env("KNOWU_INPUT_COST_PER_MILLION")?
         .parse::<f64>()
         .ok()?;
     let output_rate = non_empty_env("KNOWU_OUTPUT_COST_PER_MILLION")?
         .parse::<f64>()
         .ok()?;
+    let cache_read_rate = non_empty_env("KNOWU_CACHE_READ_COST_PER_MILLION")
+        .and_then(|value| value.parse::<f64>().ok())
+        .unwrap_or(input_rate);
+    let cache_write_rate = non_empty_env("KNOWU_CACHE_WRITE_COST_PER_MILLION")
+        .and_then(|value| value.parse::<f64>().ok());
+    if cache_write_input_tokens.unwrap_or_default() > 0 && cache_write_rate.is_none() {
+        return None;
+    }
     Some(
         input_tokens.unwrap_or_default() as f64 * input_rate / 1_000_000.0
+            + cache_read_input_tokens.unwrap_or_default() as f64 * cache_read_rate / 1_000_000.0
+            + cache_write_input_tokens.unwrap_or_default() as f64
+                * cache_write_rate.unwrap_or(input_rate)
+                / 1_000_000.0
             + output_tokens.unwrap_or_default() as f64 * output_rate / 1_000_000.0,
     )
 }
@@ -339,5 +390,42 @@ mod tests {
         assert_eq!(request["statement"], "SELECT 1");
         assert_eq!(request["timeout"], 30);
         assert!(request.get("parameters").is_none());
+    }
+
+    #[test]
+    fn inference_run_serializes_context_economics_as_camel_case() {
+        let run = InferenceRun {
+            id: "run-1".into(),
+            timestamp: "2026-08-07T12:00:00Z".into(),
+            model: "test-model".into(),
+            baseline_input_tokens: 100,
+            optimized_input_tokens: 60,
+            tokens_saved: 40,
+            reduction_percent: 40.0,
+            actual_input_tokens: Some(62),
+            output_tokens: Some(10),
+            context_budget_tokens: 80,
+            context_estimated_tokens: 55,
+            context_units_considered: 12,
+            context_units_sent: 8,
+            context_units_omitted: 4,
+            context_detail_level: "detailed".into(),
+            provider_preflight_input_tokens: Some(64),
+            cache_read_input_tokens: Some(20),
+            cache_write_input_tokens: None,
+            latency_ms: 25,
+            estimated_cost_usd: Some(0.01),
+            memory_count: 3,
+            mode: "optimized".into(),
+            memory_provider: "local".into(),
+            measurement_method: "test".into(),
+        };
+
+        let value = serde_json::to_value(run).unwrap();
+        assert_eq!(value["contextBudgetTokens"], 80);
+        assert_eq!(value["contextUnitsOmitted"], 4);
+        assert_eq!(value["providerPreflightInputTokens"], 64);
+        assert_eq!(value["cacheReadInputTokens"], 20);
+        assert!(value["cacheWriteInputTokens"].is_null());
     }
 }

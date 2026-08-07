@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     io::{Read, Write},
     path::{Component, Path, PathBuf},
@@ -397,6 +397,119 @@ fn discover_editor_workspaces(user_data: &Path) -> Vec<EditorWorkspace> {
     });
     workspaces.dedup_by(|left, right| left.path == right.path);
     workspaces
+}
+
+/// Returns recent Git working-tree paths from the editor's most recently active
+/// local workspace. This reads only workspace and Git metadata; file contents
+/// are never opened. The result lets foreground editor activity remain useful
+/// when Accessibility window titles or editor Local History are unavailable.
+pub fn recent_editor_workspace_changes(app_name: &str, since: i64, limit: usize) -> Vec<String> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let requested_app = [app_name.to_string()];
+    let Some(installation) = editor_installations()
+        .into_iter()
+        .find(|installation| editor_is_excluded(&requested_app, installation.app_name))
+    else {
+        return Vec::new();
+    };
+    let workspace_storage = installation.user_data.join("workspaceStorage");
+    let Ok(entries) = fs::read_dir(workspace_storage) else {
+        return Vec::new();
+    };
+    let since_nanos = (since.max(0) as u128).saturating_mul(1_000_000_000);
+    let mut workspaces = entries
+        .flatten()
+        .filter_map(|entry| {
+            let activity = file_signature(&entry.path().join("state.vscdb"))
+                .or_else(|| file_signature(&entry.path().join("workspace.json")))?
+                .1;
+            if activity < since_nanos {
+                return None;
+            }
+            let index = fs::read(entry.path().join("workspace.json")).ok()?;
+            let folder = serde_json::from_slice::<EditorWorkspaceIndex>(&index)
+                .ok()?
+                .folder?;
+            let path = Url::parse(&folder).ok()?.to_file_path().ok()?;
+            path.is_dir().then_some((activity, path))
+        })
+        .collect::<Vec<_>>();
+    workspaces.sort_by_key(|(activity, _)| std::cmp::Reverse(*activity));
+
+    workspaces
+        .into_iter()
+        .take(5)
+        .find_map(|(_, workspace)| {
+            let changes = git_workspace_changes(&workspace, since, limit);
+            (!changes.is_empty()).then_some(changes)
+        })
+        .unwrap_or_default()
+}
+
+fn git_workspace_changes(workspace: &Path, since: i64, limit: usize) -> Vec<String> {
+    let root_output = Command::new("git")
+        .args(["-C"])
+        .arg(workspace)
+        .args(["rev-parse", "--show-toplevel"])
+        .output();
+    let Ok(root_output) = root_output else {
+        return Vec::new();
+    };
+    if !root_output.status.success() {
+        return Vec::new();
+    }
+    let root = PathBuf::from(String::from_utf8_lossy(&root_output.stdout).trim());
+    if !root.is_dir() {
+        return Vec::new();
+    }
+
+    let commands: [&[&str]; 3] = [
+        &["diff", "--name-only", "-z", "--"],
+        &["diff", "--cached", "--name-only", "-z", "--"],
+        &["ls-files", "--others", "--exclude-standard", "-z", "--"],
+    ];
+    let mut seen = HashSet::new();
+    let mut changes = Vec::new();
+    for arguments in commands {
+        let output = Command::new("git")
+            .args(["-C"])
+            .arg(&root)
+            .args(arguments)
+            .output();
+        let Ok(output) = output else { continue };
+        if !output.status.success() {
+            continue;
+        }
+        for raw_path in output.stdout.split(|byte| *byte == 0) {
+            if raw_path.is_empty() {
+                continue;
+            }
+            let path = String::from_utf8_lossy(raw_path);
+            let Some(relative) = safe_editor_relative_path(Path::new(path.as_ref())) else {
+                continue;
+            };
+            if !seen.insert(relative.clone()) {
+                continue;
+            }
+            let modified = fs::metadata(root.join(&relative))
+                .ok()
+                .and_then(|metadata| metadata.modified().ok())
+                .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+                .map(|value| value.as_secs() as i64)
+                .unwrap_or_default();
+            if modified >= since {
+                changes.push((modified, relative));
+            }
+        }
+    }
+    changes.sort_by_key(|(modified, path)| (std::cmp::Reverse(*modified), path.clone()));
+    changes
+        .into_iter()
+        .take(limit)
+        .map(|(_, path)| path)
+        .collect()
 }
 
 fn parse_editor_history(
@@ -1192,6 +1305,34 @@ mod tests {
         assert!(safe_editor_relative_path(Path::new("certificates/client.pem")).is_none());
         assert!(safe_editor_relative_path(Path::new("config/credentials.json")).is_none());
         assert!(safe_editor_relative_path(Path::new("config/secrets.toml")).is_none());
+    }
+
+    #[test]
+    fn git_workspace_changes_return_recent_safe_paths_without_reading_contents() {
+        let directory = tempfile::tempdir().unwrap();
+        let initialized = Command::new("git")
+            .args(["init", "--quiet"])
+            .arg(directory.path())
+            .status()
+            .unwrap();
+        assert!(initialized.success());
+        fs::create_dir_all(directory.path().join("src")).unwrap();
+        fs::create_dir_all(directory.path().join("node_modules/pkg")).unwrap();
+        fs::write(directory.path().join("src/main.rs"), "fn main() {}\n").unwrap();
+        fs::write(directory.path().join(".env"), "SECRET=value\n").unwrap();
+        fs::write(
+            directory.path().join("node_modules/pkg/index.js"),
+            "ignored\n",
+        )
+        .unwrap();
+
+        let changes = git_workspace_changes(
+            directory.path(),
+            Utc::now().timestamp().saturating_sub(60),
+            10,
+        );
+
+        assert_eq!(changes, ["src/main.rs"]);
     }
 
     #[test]

@@ -188,6 +188,30 @@ pub struct ChatMessage {
     pub content: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadContextEvent {
+    pub observed_at: String,
+    pub app_name: String,
+    pub source: String,
+    pub title: Option<String>,
+    pub resource: Option<String>,
+    pub search_query: Option<String>,
+    pub observed_active_seconds: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadContext {
+    pub version: u8,
+    pub subject: String,
+    pub signal_count: usize,
+    pub apps: Vec<String>,
+    pub observed_from: Option<String>,
+    pub observed_through: Option<String>,
+    pub events: Vec<ThreadContextEvent>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct QueryActivityFacts {

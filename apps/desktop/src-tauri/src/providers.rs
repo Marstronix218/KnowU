@@ -19,6 +19,9 @@ pub struct CompletionResult {
     pub model: String,
     pub input_tokens: Option<i64>,
     pub output_tokens: Option<i64>,
+    pub preflight_input_tokens: Option<i64>,
+    pub cache_read_input_tokens: Option<i64>,
+    pub cache_write_input_tokens: Option<i64>,
 }
 
 #[derive(Clone)]
@@ -67,10 +70,18 @@ impl ProviderClient {
         if let Ok(value) = std::env::var(match provider {
             "openai" => "OPENAI_API_KEY",
             "anthropic" => "ANTHROPIC_API_KEY",
+            "bedrock" => "AWS_BEDROCK_API_KEY",
             _ => unreachable!(),
         }) {
             if !value.trim().is_empty() {
                 return Ok(value);
+            }
+        }
+        if provider == "bedrock" {
+            if let Ok(value) = std::env::var("AWS_BEARER_TOKEN_BEDROCK") {
+                if !value.trim().is_empty() {
+                    return Ok(value);
+                }
             }
         }
         Entry::new(KEYCHAIN_SERVICE, provider)
@@ -105,6 +116,23 @@ impl ProviderClient {
                     .send()
                     .await?
             }
+            "bedrock" => {
+                let model = bedrock_model();
+                let validation_message = [ChatMessage {
+                    role: "user".into(),
+                    content: "Reply OK".into(),
+                }];
+                self.http
+                    .post(bedrock_url(&model, "count-tokens")?)
+                    .bearer_auth(key)
+                    .json(&bedrock_count_tokens_request(
+                        "Validate the configured Amazon Bedrock credential.",
+                        &validation_message,
+                        false,
+                    ))
+                    .send()
+                    .await?
+            }
             _ => unreachable!(),
         };
         if result.status().is_success() {
@@ -120,13 +148,22 @@ impl ProviderClient {
         system: &str,
         conversation: &[ChatMessage],
         message: &str,
+        input_token_limit: i64,
     ) -> AppResult<CompletionResult> {
         let mut turns = conversation.to_vec();
         turns.push(ChatMessage {
             role: "user".into(),
             content: message.into(),
         });
-        self.complete(provider, system, &turns, 1600, None).await
+        self.complete(
+            provider,
+            system,
+            &turns,
+            1600,
+            None,
+            Some(input_token_limit),
+        )
+        .await
     }
 
     pub async fn refresh_profile(
@@ -164,6 +201,7 @@ impl ProviderClient {
                 }],
                 2400,
                 Some(profile_response_format()),
+                None,
             )
             .await?;
         let parsed = parse_json_response(&raw.text)?;
@@ -249,6 +287,7 @@ impl ProviderClient {
         messages: &[ChatMessage],
         max_tokens: u32,
         response_format: Option<Value>,
+        input_token_limit: Option<i64>,
     ) -> AppResult<CompletionResult> {
         let key = self.key(provider)?;
         match provider {
@@ -296,6 +335,9 @@ impl ProviderClient {
                     model: body["model"].as_str().unwrap_or("gpt-5-mini").into(),
                     input_tokens: body["usage"]["input_tokens"].as_i64(),
                     output_tokens: body["usage"]["output_tokens"].as_i64(),
+                    preflight_input_tokens: None,
+                    cache_read_input_tokens: None,
+                    cache_write_input_tokens: None,
                 })
             }
             "anthropic" => {
@@ -336,7 +378,56 @@ impl ProviderClient {
                     model: body["model"].as_str().unwrap_or("claude-sonnet-4-5").into(),
                     input_tokens: body["usage"]["input_tokens"].as_i64(),
                     output_tokens: body["usage"]["output_tokens"].as_i64(),
+                    preflight_input_tokens: None,
+                    cache_read_input_tokens: body["usage"]["cache_read_input_tokens"].as_i64(),
+                    cache_write_input_tokens: body["usage"]["cache_creation_input_tokens"].as_i64(),
                 })
+            }
+            "bedrock" => {
+                let model = bedrock_model();
+                let cache_prompt = bedrock_prompt_cache_enabled(system, &model);
+                let count_response = self
+                    .http
+                    .post(bedrock_url(&model, "count-tokens")?)
+                    .bearer_auth(&key)
+                    .json(&bedrock_count_tokens_request(
+                        system,
+                        messages,
+                        cache_prompt,
+                    ))
+                    .send()
+                    .await?;
+                let count_status = count_response.status();
+                let count_body: Value = count_response.json().await?;
+                if !count_status.is_success() {
+                    return Err(provider_status_error(count_status));
+                }
+                let preflight_input_tokens = bedrock_preflight_tokens(&count_body)?;
+                if input_token_limit.is_some_and(|limit| preflight_input_tokens > limit) {
+                    return Err(AppError::InvalidInput(
+                        "The exact Amazon Bedrock prompt count exceeded the configured request budget; shorten the question or reduce selected context."
+                            .into(),
+                    ));
+                }
+
+                let response = self
+                    .http
+                    .post(bedrock_url(&model, "converse")?)
+                    .bearer_auth(key)
+                    .json(&bedrock_converse_request(
+                        system,
+                        messages,
+                        max_tokens,
+                        cache_prompt,
+                    ))
+                    .send()
+                    .await?;
+                let status = response.status();
+                let body: Value = response.json().await?;
+                if !status.is_success() {
+                    return Err(provider_status_error(status));
+                }
+                bedrock_completion(&body, model, Some(preflight_input_tokens))
             }
             _ => Err(AppError::InvalidInput("Unsupported provider.".into())),
         }
@@ -345,9 +436,144 @@ impl ProviderClient {
 
 fn validate_provider(provider: &str) -> AppResult<()> {
     match provider {
-        "openai" | "anthropic" => Ok(()),
+        "openai" | "anthropic" | "bedrock" => Ok(()),
         _ => Err(AppError::InvalidInput("Unsupported provider.".into())),
     }
+}
+
+fn bedrock_region() -> String {
+    std::env::var("AWS_BEDROCK_REGION")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "us-east-1".into())
+}
+
+fn bedrock_model() -> String {
+    std::env::var("AWS_BEDROCK_MODEL_ID")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "us.anthropic.claude-sonnet-4-6".into())
+}
+
+fn bedrock_url(model: &str, operation: &str) -> AppResult<reqwest::Url> {
+    let mut url = reqwest::Url::parse(&format!(
+        "https://bedrock-runtime.{}.amazonaws.com",
+        bedrock_region()
+    ))
+    .map_err(|_| AppError::InvalidInput("Invalid Amazon Bedrock region.".into()))?;
+    url.path_segments_mut()
+        .map_err(|_| AppError::InvalidInput("Invalid Amazon Bedrock endpoint.".into()))?
+        .extend(["model", model, operation]);
+    Ok(url)
+}
+
+fn bedrock_messages(messages: &[ChatMessage]) -> Vec<Value> {
+    messages
+        .iter()
+        .map(|message| {
+            json!({
+                "role": if message.role == "assistant" { "assistant" } else { "user" },
+                "content": [{"text": message.content}]
+            })
+        })
+        .collect()
+}
+
+fn bedrock_converse_request(
+    system: &str,
+    messages: &[ChatMessage],
+    max_tokens: u32,
+    cache_prompt: bool,
+) -> Value {
+    let mut system_blocks = vec![json!({"text": system})];
+    if cache_prompt {
+        system_blocks.push(json!({"cachePoint": {"type": "default"}}));
+    }
+    json!({
+        "system": system_blocks,
+        "messages": bedrock_messages(messages),
+        "inferenceConfig": {"maxTokens": max_tokens}
+    })
+}
+
+fn bedrock_count_tokens_request(
+    system: &str,
+    messages: &[ChatMessage],
+    cache_prompt: bool,
+) -> Value {
+    let mut system_blocks = vec![json!({"text": system})];
+    if cache_prompt {
+        system_blocks.push(json!({"cachePoint": {"type": "default"}}));
+    }
+    json!({
+        "input": {
+            "converse": {
+                "system": system_blocks,
+                "messages": bedrock_messages(messages)
+            }
+        }
+    })
+}
+
+fn bedrock_response_text(body: &Value) -> Option<String> {
+    body.get("output")?
+        .get("message")?
+        .get("content")?
+        .as_array()?
+        .iter()
+        .find_map(|block| block.get("text")?.as_str().map(ToOwned::to_owned))
+}
+
+fn bedrock_preflight_tokens(body: &Value) -> AppResult<i64> {
+    body["inputTokens"].as_i64().ok_or_else(|| {
+        AppError::Provider("Amazon Bedrock returned an invalid CountTokens response.".into())
+    })
+}
+
+fn bedrock_completion(
+    body: &Value,
+    model: String,
+    preflight_input_tokens: Option<i64>,
+) -> AppResult<CompletionResult> {
+    let text = bedrock_response_text(body)
+        .ok_or_else(|| AppError::Provider("The provider returned no text.".into()))?;
+    Ok(CompletionResult {
+        text,
+        model,
+        input_tokens: body["usage"]["inputTokens"].as_i64(),
+        output_tokens: body["usage"]["outputTokens"].as_i64(),
+        preflight_input_tokens,
+        cache_read_input_tokens: body["usage"]["cacheReadInputTokens"].as_i64(),
+        cache_write_input_tokens: body["usage"]["cacheWriteInputTokens"].as_i64(),
+    })
+}
+
+fn bedrock_prompt_cache_enabled(system: &str, model: &str) -> bool {
+    let configured_minimum = std::env::var("AWS_BEDROCK_CACHE_MIN_TOKENS")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok());
+    let documented_minimum = if model.contains("anthropic.claude-sonnet-4-6") {
+        Some(1_024)
+    } else {
+        configured_minimum
+    };
+    let Some(minimum) = documented_minimum else {
+        return false;
+    };
+    if estimated_prompt_tokens(system) < minimum {
+        return false;
+    }
+    match std::env::var("AWS_BEDROCK_ENABLE_PROMPT_CACHE") {
+        Ok(value) => matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        Err(_) => true,
+    }
+}
+
+fn estimated_prompt_tokens(value: &str) -> usize {
+    value.chars().count().div_ceil(4)
 }
 
 fn provider_status_error(status: StatusCode) -> AppError {
@@ -587,5 +813,105 @@ mod tests {
                 updated_at: 0,
             }]
         ));
+    }
+
+    #[test]
+    fn builds_bedrock_converse_request_with_cache_point() {
+        let request = bedrock_converse_request(
+            "Stable context",
+            &[
+                ChatMessage {
+                    role: "user".into(),
+                    content: "What changed?".into(),
+                },
+                ChatMessage {
+                    role: "assistant".into(),
+                    content: "The query changed.".into(),
+                },
+            ],
+            900,
+            true,
+        );
+
+        assert_eq!(request["system"][0]["text"], "Stable context");
+        assert_eq!(request["system"][1]["cachePoint"]["type"], "default");
+        assert_eq!(request["messages"][0]["role"], "user");
+        assert_eq!(
+            request["messages"][0]["content"][0]["text"],
+            "What changed?"
+        );
+        assert_eq!(request["messages"][1]["role"], "assistant");
+        assert_eq!(request["inferenceConfig"]["maxTokens"], 900);
+        assert!(validate_provider("bedrock").is_ok());
+
+        let uncached = bedrock_converse_request("Context", &[], 100, false);
+        assert_eq!(uncached["system"].as_array().map(Vec::len), Some(1));
+    }
+
+    #[test]
+    fn builds_bedrock_count_tokens_request_without_inference_config() {
+        let request = bedrock_count_tokens_request(
+            "Context",
+            &[ChatMessage {
+                role: "user".into(),
+                content: "Question".into(),
+            }],
+            true,
+        );
+
+        assert_eq!(request["input"]["converse"]["system"][0]["text"], "Context");
+        assert_eq!(
+            request["input"]["converse"]["system"][1]["cachePoint"]["type"],
+            "default"
+        );
+        assert_eq!(
+            request["input"]["converse"]["messages"][0]["content"][0]["text"],
+            "Question"
+        );
+        assert!(request["input"]["converse"]
+            .get("inferenceConfig")
+            .is_none());
+    }
+
+    #[test]
+    fn parses_bedrock_converse_text_response() {
+        let body = json!({
+            "output": {
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {"reasoningContent": {"reasoningText": {"text": "internal"}}},
+                        {"text": "Visible answer"}
+                    ]
+                }
+            },
+            "usage": {
+                "inputTokens": 1400,
+                "outputTokens": 72,
+                "cacheReadInputTokens": 1024,
+                "cacheWriteInputTokens": 376
+            }
+        });
+
+        let completion = bedrock_completion(&body, "test-model".into(), Some(1_398))
+            .expect("valid Converse response should parse");
+        assert_eq!(completion.text, "Visible answer");
+        assert_eq!(completion.model, "test-model");
+        assert_eq!(completion.preflight_input_tokens, Some(1_398));
+        assert_eq!(completion.input_tokens, Some(1_400));
+        assert_eq!(completion.output_tokens, Some(72));
+        assert_eq!(completion.cache_read_input_tokens, Some(1_024));
+        assert_eq!(completion.cache_write_input_tokens, Some(376));
+        assert_eq!(estimated_prompt_tokens(&"x".repeat(4_096)), 1_024);
+    }
+
+    #[test]
+    fn bedrock_preflight_requires_a_numeric_token_count() {
+        assert_eq!(
+            bedrock_preflight_tokens(&json!({"inputTokens": 42})).unwrap(),
+            42
+        );
+        assert!(bedrock_preflight_tokens(&json!({})).is_err());
+        assert!(bedrock_preflight_tokens(&json!({"inputTokens": "42"})).is_err());
     }
 }

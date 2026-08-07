@@ -23,6 +23,16 @@ export const mockActivity: ActivityEvent[] = [
     source: "chrome",
   },
   {
+    id: "event-2-save",
+    appName: "Visual Studio Code",
+    windowTitle: "KnowU — apps/desktop/src/App.tsx",
+    pageTitle: "apps/desktop/src/App.tsx",
+    startedAt: minutesAgo(28),
+    durationSeconds: 0,
+    topic: "KnowU implementation",
+    source: "editor",
+  },
+  {
     id: "event-2",
     appName: "Visual Studio Code",
     windowTitle: "KnowU — App.tsx",

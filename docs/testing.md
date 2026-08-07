@@ -89,17 +89,22 @@ Chrome profile, or live provider accounts. Before an alpha handoff:
    failed event is not replayed.
 10. Pause the app and verify the extension follows the native state and no new app-owned activity rows
     are added.
-11. Exercise OpenAI or Anthropic validation, profile refresh, and chat with a
-    non-production key.
+11. Exercise OpenAI, Anthropic, and Amazon Bedrock validation, profile refresh,
+    and chat with non-production keys. For Bedrock, confirm the run exposes
+    CountTokens preflight and cache-read/cache-write metrics.
 12. Add a profile correction, refresh, and confirm the correction remains.
 13. Dismiss a recommendation and confirm it leaves the dashboard.
 14. With known Snowflake history imported, ask “How long have I been working on
     Snowflake?” Confirm the answer separates first-to-last calendar span from
     de-overlapped live activity time, labels Chrome-history duration as
     unreliable foreground evidence, and states the local retention limit.
-15. Expand **Compare context payloads**. Confirm KnowU Context contains compact
-    aggregate facts but no URLs, titles, searches, event IDs, or browser-profile
-    IDs, and that it remains smaller than Full Context.
+15. Choose **Ask with context** on a 26-signal Snowflake thread. Confirm the
+    local preview shows the candidate titles/searches/resources, and then expand
+    **Compare context payloads**. The sent context should contain all aggregate
+    facts and at least ten distinct selected-event units while remaining under
+    the configured token budget and smaller than Full Context. Confirm it has no
+    URL query strings/fragments, credentials, event IDs, browser-profile IDs, or
+    absolute local paths.
 16. Repeat once with EverOS unavailable and once with Snowflake unavailable.
     Local activity facts must still answer the question; the UI should label the
     EverOS fallback and Snowflake telemetry status accurately.
@@ -127,7 +132,7 @@ owned by the Rust core.
 
 - no automated real-macOS Accessibility test
 - no real Chrome Native Messaging end-to-end test
-- no provider contract test against live OpenAI or Anthropic APIs
+- no provider contract test against live OpenAI, Anthropic, or Amazon Bedrock APIs
 - no packaged-app, code-signing, notarization, update, or installer test
 - no secure-deletion claim or forensic-erasure test
 - no independent security assessment

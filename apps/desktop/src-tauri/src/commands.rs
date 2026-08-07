@@ -30,17 +30,23 @@ use crate::{
         estimated_cost_usd, estimated_tokens, provider_scaled_measurement, InferenceRun,
         SnowflakeAnalyticsService,
     },
-    context::{build_baseline_context, build_optimized_context, compose_measured_prompt},
+    context::{
+        build_baseline_context, build_optimized_context_package, compose_measured_prompt,
+        configured_context_token_budget, configured_request_token_budget,
+        CHAT_OUTPUT_TOKEN_RESERVE,
+    },
     db::Database,
     error::{AppError, AppResult},
     memory::{
         approved_profile_memories, correction_memory, demo_seed_memories, safe_local_search,
         EverOSMemoryService, MemoryService,
     },
-    models::{ChatMessage, DashboardRequest, HistoryRequest, Settings, UserCorrection},
+    models::{
+        ChatMessage, DashboardRequest, HistoryRequest, Settings, ThreadContext, UserCorrection,
+    },
     platform::{
         collection_status, discover_chrome_profiles, ensure_pairing_token,
-        import_selected_chrome_history, RuntimeStatus,
+        import_selected_chrome_history, recent_editor_workspace_changes, RuntimeStatus,
     },
     providers::ProviderClient,
     threading::semantic_topics,
@@ -98,6 +104,9 @@ struct UiUsage {
 
 const RECENT_ACTIVITY_LIMIT: usize = 200;
 const TOPIC_EVIDENCE_LIMIT: usize = 3;
+const MAX_CHAT_QUESTION_CHARS: usize = 4_000;
+const MAX_CHAT_HISTORY_MESSAGE_CHARS: usize = 4_000;
+const MAX_CHAT_HISTORY_TOKENS: i64 = 2_000;
 
 #[tauri::command]
 pub fn get_dashboard(range: String, state: State<'_, AppState>) -> AppResult<Value> {
@@ -112,6 +121,7 @@ pub fn get_dashboard(range: String, state: State<'_, AppState>) -> AppResult<Val
         offset: None,
     })?;
     let semantic_topics = semantic_topics(&history);
+    let editor_workspace_changes = editor_workspace_changes_by_app(&history, start_at);
     let palette = ["#4968a6", "#7c5c9e", "#399279", "#c07a3e", "#7e8798"];
     let behavioral_guidance_enabled = state.db.settings()?.behavioral_guidance_enabled;
     let usage = |values: Vec<crate::models::UsageItem>| {
@@ -197,7 +207,11 @@ pub fn get_dashboard(range: String, state: State<'_, AppState>) -> AppResult<Val
         "siteUsage":usage(dashboard.websites),
         "recentActivity":recent.into_iter().map(|event| {
             let semantic_topic = event.id.and_then(|id| semantic_topics.get(&id));
-            activity_to_ui_with_topic(event, semantic_topic.map(String::as_str))
+            let modified_files = editor_workspace_changes
+                .get(&event.app_name.to_ascii_lowercase())
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            activity_to_ui_with_topic(event, semantic_topic.map(String::as_str), modified_files)
         }).collect::<Vec<_>>(),
         "insights":insights,
         "recommendations":recommendations,
@@ -342,11 +356,16 @@ pub fn get_activity_history(
         offset: None,
     })?;
     let semantic_topics = semantic_topics(&history);
+    let editor_workspace_changes = editor_workspace_changes_by_app(&history, start_at);
     Ok(history
         .into_iter()
         .map(|event| {
             let semantic_topic = event.id.and_then(|id| semantic_topics.get(&id));
-            activity_to_ui_with_topic(event, semantic_topic.map(String::as_str))
+            let modified_files = editor_workspace_changes
+                .get(&event.app_name.to_ascii_lowercase())
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            activity_to_ui_with_topic(event, semantic_topic.map(String::as_str), modified_files)
         })
         .collect())
 }
@@ -455,6 +474,52 @@ pub fn open_resource(url: String) -> AppResult<()> {
             "The system could not open the resource.".into(),
         ))
     }
+}
+
+fn normalized_application_name(value: &str) -> AppResult<String> {
+    let app_name = value.trim();
+    if app_name.is_empty()
+        || app_name.chars().count() > 128
+        || value.chars().any(char::is_control)
+        || app_name.contains(['/', '\\'])
+        || app_name.starts_with('-')
+        || matches!(app_name, "." | "..")
+    {
+        return Err(AppError::InvalidInput(
+            "The application name is invalid.".into(),
+        ));
+    }
+    Ok(match app_name {
+        "Code" => "Visual Studio Code".into(),
+        _ => app_name.into(),
+    })
+}
+
+#[tauri::command]
+pub fn open_application(app_name: String) -> AppResult<()> {
+    let app_name = normalized_application_name(&app_name)?;
+    let status = open_native_application(&app_name)?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(AppError::InvalidInput(
+            "The system could not open the application.".into(),
+        ))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn open_native_application(app_name: &str) -> AppResult<std::process::ExitStatus> {
+    Ok(Command::new("/usr/bin/open")
+        .args(["-a", app_name])
+        .status()?)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn open_native_application(_app_name: &str) -> AppResult<std::process::ExitStatus> {
+    Err(AppError::InvalidInput(
+        "Opening native applications is currently supported only on macOS.".into(),
+    ))
 }
 
 #[cfg(target_os = "macos")]
@@ -1061,7 +1126,7 @@ pub fn save_settings(
 ) -> AppResult<Value> {
     let mut current = state.db.settings()?;
     if let Some(provider) = settings.get("provider").and_then(Value::as_str) {
-        if !matches!(provider, "openai" | "anthropic") {
+        if !matches!(provider, "openai" | "anthropic" | "bedrock") {
             return Err(AppError::InvalidInput("Unsupported provider.".into()));
         }
         current.selected_provider = Some(provider.into());
@@ -1123,7 +1188,7 @@ pub struct UiChatMessage {
 pub async fn chat(
     messages: Vec<UiChatMessage>,
     mode: Option<String>,
-    context_brief: Option<String>,
+    thread_context: Option<ThreadContext>,
     state: State<'_, AppState>,
 ) -> AppResult<Value> {
     let last = messages
@@ -1134,6 +1199,11 @@ pub async fn chat(
             "The final chat message must be a non-empty user question.".into(),
         ));
     }
+    if last.content.chars().count() > MAX_CHAT_QUESTION_CHARS {
+        return Err(AppError::InvalidInput(format!(
+            "The question may contain at most {MAX_CHAT_QUESTION_CHARS} characters."
+        )));
+    }
     let mode = mode.unwrap_or_else(|| "optimized".into());
     if mode != "optimized" {
         return Err(AppError::InvalidInput(
@@ -1141,13 +1211,38 @@ pub async fn chat(
                 .into(),
         ));
     }
-    let history = messages[..messages.len() - 1]
+    let thread_context = validated_thread_context(thread_context)?;
+    let request_budget = configured_request_token_budget();
+    let question_tokens = estimated_tokens(&last.content);
+    let history_token_budget = MAX_CHAT_HISTORY_TOKENS.min(
+        request_budget
+            .saturating_sub(CHAT_OUTPUT_TOKEN_RESERVE)
+            .saturating_sub(question_tokens)
+            .saturating_sub(900),
+    );
+    let history =
+        bounded_chat_history(&messages[..messages.len() - 1], history_token_budget.max(0));
+    let conversation_text = history
         .iter()
-        .map(|message| ChatMessage {
-            role: message.role.clone(),
-            content: message.content.clone(),
-        })
-        .collect::<Vec<_>>();
+        .map(|message| format!("{}: {}", message.role, message.content))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let non_context_tokens = estimated_tokens(&compose_measured_prompt(
+        "",
+        &conversation_text,
+        &last.content,
+    ));
+    let safe_input_limit = request_budget
+        .saturating_sub(CHAT_OUTPUT_TOKEN_RESERVE)
+        .saturating_mul(85)
+        / 100;
+    let available_context_tokens = safe_input_limit.saturating_sub(non_context_tokens);
+    if available_context_tokens < 800 {
+        return Err(AppError::InvalidInput(
+            "The question and recent conversation leave no safe context budget; shorten the question or start a new chat."
+                .into(),
+        ));
+    }
     let provider = selected_provider(&state.db)?;
     let now = Utc::now().timestamp();
     let (today_start, _) = range_bounds("today")?;
@@ -1158,23 +1253,25 @@ pub async fn chat(
     });
     let profile = state.db.profile()?;
     let corrections = state.db.corrections()?;
+    let memory_query = memory_query_text(&last.content, thread_context.as_ref());
+    let activity_query = activity_query_text(&last.content, &history, thread_context.as_ref());
     let (retrieved_memories, memory_provider, memory_warning) = if state.memory.is_configured() {
-        match state.memory.search_memories(&last.content, 5).await {
+        match state.memory.search_memories(&memory_query, 8).await {
             Ok(memories) if !memories.is_empty() => (memories, "everos", None),
             Ok(_) => (
-                safe_local_search(&profile, &corrections, &last.content, 5),
+                safe_local_search(&profile, &corrections, &memory_query, 8),
                 "local-fallback",
                 Some("EverOS returned no matching memories, so KnowU used approved local profile memories.".to_string()),
             ),
             Err(error) => (
-                safe_local_search(&profile, &corrections, &last.content, 5),
+                safe_local_search(&profile, &corrections, &memory_query, 8),
                 "local-fallback",
                 Some(format!("EverOS retrieval failed; approved local memories were used: {error}")),
             ),
         }
     } else {
         (
-            safe_local_search(&profile, &corrections, &last.content, 5),
+            safe_local_search(&profile, &corrections, &memory_query, 8),
             "local-fallback",
             Some(
                 "EverOS is not configured. Set EVEROS_API_KEY to use persistent retrieval."
@@ -1182,7 +1279,6 @@ pub async fn chat(
             ),
         )
     };
-    let activity_query = activity_query_text(&last.content, &history, context_brief.as_deref());
     let (activity_start, activity_end) = query_activity_range(&last.content, today_start, now);
     let activity_facts =
         state
@@ -1194,29 +1290,35 @@ pub async fn chat(
         &activity_summary,
         &retrieved_memories,
         &activity_facts,
-        context_brief.as_deref(),
+        thread_context.as_ref(),
     );
-    let optimized_context = build_optimized_context(
+    let optimized_package = build_optimized_context_package(
         &retrieved_memories,
         &activity_facts,
-        context_brief.as_deref(),
+        thread_context.as_ref(),
+        configured_context_token_budget().min(available_context_tokens),
     );
-    let conversation_text = history
-        .iter()
-        .map(|message| format!("{}: {}", message.role, message.content))
-        .collect::<Vec<_>>()
-        .join("\n");
+    let optimized_context = &optimized_package.text;
     let baseline_prompt =
         compose_measured_prompt(&baseline_context, &conversation_text, &last.content);
     let optimized_prompt =
-        compose_measured_prompt(&optimized_context, &conversation_text, &last.content);
-    let selected_context = &optimized_context;
+        compose_measured_prompt(optimized_context, &conversation_text, &last.content);
+    let selected_context = optimized_context;
     let provider_started = Instant::now();
     let completion = state
         .providers
-        .chat(&provider, selected_context, &history, &last.content)
+        .chat(
+            &provider,
+            selected_context,
+            &history,
+            &last.content,
+            request_budget.saturating_sub(CHAT_OUTPUT_TOKEN_RESERVE),
+        )
         .await?;
     let latency_ms = provider_started.elapsed().as_millis() as i64;
+    let full_prompt_input_tokens = completion
+        .preflight_input_tokens
+        .or(completion.input_tokens);
     let measurement =
         if state.analytics.is_configured() && state.analytics.prompt_tokenization_enabled() {
             state
@@ -1227,7 +1329,7 @@ pub async fn chat(
                     provider_scaled_measurement(
                         &baseline_prompt,
                         &optimized_prompt,
-                        completion.input_tokens,
+                        full_prompt_input_tokens,
                         &mode,
                     )
                 })
@@ -1235,7 +1337,7 @@ pub async fn chat(
             provider_scaled_measurement(
                 &baseline_prompt,
                 &optimized_prompt,
-                completion.input_tokens,
+                full_prompt_input_tokens,
                 &mode,
             )
         };
@@ -1254,8 +1356,22 @@ pub async fn chat(
         actual_input_tokens: completion.input_tokens,
         output_tokens,
         latency_ms,
-        estimated_cost_usd: estimated_cost_usd(completion.input_tokens, output_tokens),
+        estimated_cost_usd: estimated_cost_usd(
+            completion.input_tokens,
+            output_tokens,
+            completion.cache_read_input_tokens,
+            completion.cache_write_input_tokens,
+        ),
         memory_count: retrieved_memories.len() as i64,
+        context_budget_tokens: optimized_package.manifest.budget_tokens,
+        context_estimated_tokens: optimized_package.manifest.estimated_tokens,
+        context_units_considered: optimized_package.manifest.units_considered as i64,
+        context_units_sent: optimized_package.manifest.units_sent as i64,
+        context_units_omitted: optimized_package.manifest.units_omitted as i64,
+        context_detail_level: optimized_package.manifest.detail_level.clone(),
+        provider_preflight_input_tokens: completion.preflight_input_tokens,
+        cache_read_input_tokens: completion.cache_read_input_tokens,
+        cache_write_input_tokens: completion.cache_write_input_tokens,
         mode: mode.clone(),
         memory_provider: memory_provider.into(),
         measurement_method: measurement.measurement_method.clone(),
@@ -1300,6 +1416,15 @@ pub async fn chat(
             "latencyMs":latency_ms,
             "estimatedCostUsd":run.estimated_cost_usd,
             "memoryCount":retrieved_memories.len(),
+            "contextBudgetTokens":optimized_package.manifest.budget_tokens,
+            "contextEstimatedTokens":optimized_package.manifest.estimated_tokens,
+            "contextUnitsConsidered":optimized_package.manifest.units_considered,
+            "contextUnitsSent":optimized_package.manifest.units_sent,
+            "contextUnitsOmitted":optimized_package.manifest.units_omitted,
+            "contextDetailLevel":optimized_package.manifest.detail_level,
+            "providerPreflightInputTokens":completion.preflight_input_tokens,
+            "cacheReadInputTokens":completion.cache_read_input_tokens,
+            "cacheWriteInputTokens":completion.cache_write_input_tokens,
             "measurementMethod":measurement.measurement_method,
             "telemetryStatus":telemetry_status,
             "baselineContextPreview":baseline_context,
@@ -1372,6 +1497,7 @@ pub fn delete_all_data(state: State<'_, AppState>) -> AppResult<()> {
     // Credentials live outside SQLite and are explicitly included in single-action deletion.
     state.providers.delete_key("openai")?;
     state.providers.delete_key("anthropic")?;
+    state.providers.delete_key("bedrock")?;
     state.db.delete_all_local_data()?;
     ensure_pairing_token(&state.db)?;
     if let Some(home) = dirs::home_dir() {
@@ -1489,9 +1615,33 @@ fn stable_profile_id(section: &str, value: &str) -> String {
     format!("inferred-{:x}", digest.finalize())
 }
 
+fn editor_workspace_changes_by_app(
+    history: &[crate::models::ActivityEvent],
+    since: i64,
+) -> HashMap<String, Vec<String>> {
+    let mut changes = HashMap::new();
+    for event in history {
+        let key = event.app_name.to_ascii_lowercase();
+        if changes.contains_key(&key)
+            || !matches!(
+                key.as_str(),
+                "code" | "visual studio code" | "cursor" | "cortex code" | "xcode"
+            )
+        {
+            continue;
+        }
+        let paths = recent_editor_workspace_changes(&event.app_name, since, 8);
+        if !paths.is_empty() {
+            changes.insert(key, paths);
+        }
+    }
+    changes
+}
+
 fn activity_to_ui_with_topic(
     event: crate::models::ActivityEvent,
     semantic_topic: Option<&str>,
+    modified_files: &[String],
 ) -> Value {
     let topic = semantic_topic.map(str::to_string).or_else(|| {
         if event.source == crate::models::ActivitySource::EditorHistory {
@@ -1514,6 +1664,7 @@ fn activity_to_ui_with_topic(
         "browserProfile":event.browser_profile_id,
         "startedAt":timestamp(event.occurred_at),
         "durationSeconds":event.duration_seconds,
+        "modifiedFiles":modified_files,
         "topic":topic,
         "source":match event.source {
             crate::models::ActivitySource::AppFocus=>"collector",
@@ -1566,33 +1717,142 @@ fn query_activity_range(query: &str, today_start: i64, now: i64) -> (i64, i64) {
 fn activity_query_text(
     question: &str,
     history: &[ChatMessage],
-    context_brief: Option<&str>,
+    thread_context: Option<&ThreadContext>,
 ) -> String {
     let references_prior_subject = question
         .split(|character: char| !character.is_alphanumeric())
         .map(str::to_ascii_lowercase)
         .any(|word| matches!(word.as_str(), "it" | "that" | "this" | "them" | "those"));
-    if !references_prior_subject || crate::db::has_meaningful_activity_subject(question) {
-        return question.into();
-    }
-
-    let mut parts = vec![question.trim().to_string()];
-    if let Some(subject) = context_brief
-        .and_then(|brief| brief.lines().next())
-        .and_then(|line| line.strip_prefix("Context brief:"))
-        .map(str::trim)
-        .filter(|subject| !subject.is_empty())
-    {
-        parts.push(subject.into());
-    }
-    if let Some(previous_question) = history
-        .iter()
-        .rev()
-        .find(|message| message.role == "user" && !message.content.trim().is_empty())
-    {
-        parts.push(previous_question.content.trim().into());
+    let mut parts = vec![memory_query_text(question, thread_context)];
+    if references_prior_subject && !crate::db::has_meaningful_activity_subject(question) {
+        if let Some(previous_question) = history
+            .iter()
+            .rev()
+            .find(|message| message.role == "user" && !message.content.trim().is_empty())
+        {
+            parts.push(previous_question.content.trim().into());
+        }
     }
     parts.join(" ")
+}
+
+fn memory_query_text(question: &str, thread_context: Option<&ThreadContext>) -> String {
+    let has_explicit_known_subject = contains_known_activity_subject(question);
+    let mut parts = vec![question.trim().to_string()];
+    if let Some(subject) = thread_context
+        .and_then(|context| safe_memory_subject(&context.subject))
+        .filter(|subject| {
+            !question
+                .to_ascii_lowercase()
+                .contains(&subject.to_ascii_lowercase())
+        })
+        .filter(|_| !has_explicit_known_subject)
+    {
+        parts.push(subject);
+    }
+    parts.join(" ")
+}
+
+fn safe_memory_subject(subject: &str) -> Option<String> {
+    let subject = subject.split_whitespace().collect::<Vec<_>>().join(" ");
+    let lowered = subject.to_ascii_lowercase();
+    let looks_sensitive = subject.is_empty()
+        || [
+            "authorization:",
+            "bearer ",
+            "api_key",
+            "apikey",
+            "password=",
+            "secret=",
+            "token=",
+            "file://",
+            "/users/",
+            "/home/",
+        ]
+        .iter()
+        .any(|marker| lowered.contains(marker));
+    (!looks_sensitive).then_some(subject)
+}
+
+fn contains_known_activity_subject(question: &str) -> bool {
+    let question = question.to_ascii_lowercase();
+    [
+        "bigquery",
+        "databricks",
+        "openai",
+        "postgresql",
+        "snowflake",
+    ]
+    .iter()
+    .any(|subject| question.contains(subject))
+}
+
+fn validated_thread_context(context: Option<ThreadContext>) -> AppResult<Option<ThreadContext>> {
+    let Some(context) = context else {
+        return Ok(None);
+    };
+    if context.version != 1 {
+        return Err(AppError::InvalidInput(
+            "Unsupported thread-context version.".into(),
+        ));
+    }
+    if context.subject.trim().is_empty() || context.subject.chars().count() > 160 {
+        return Err(AppError::InvalidInput(
+            "Thread context requires a bounded subject.".into(),
+        ));
+    }
+    if context.events.len() > 100 {
+        return Err(AppError::InvalidInput(
+            "Thread context may include at most 100 event candidates.".into(),
+        ));
+    }
+    Ok(Some(context))
+}
+
+fn is_synthetic_welcome(message: &UiChatMessage) -> bool {
+    message.role == "assistant"
+        && (message
+            .content
+            .starts_with("Your selected thread is ready.")
+            || message.content.starts_with("Ask anything. I’ll retrieve"))
+}
+
+fn bounded_chat_history(messages: &[UiChatMessage], token_budget: i64) -> Vec<ChatMessage> {
+    if token_budget <= 0 {
+        return Vec::new();
+    }
+    let mut remaining = token_budget;
+    let mut selected = Vec::new();
+    for message in messages
+        .iter()
+        .rev()
+        .filter(|message| matches!(message.role.as_str(), "user" | "assistant"))
+        .filter(|message| !is_synthetic_welcome(message))
+        .take(8)
+    {
+        let content = message
+            .content
+            .chars()
+            .take(MAX_CHAT_HISTORY_MESSAGE_CHARS)
+            .collect::<String>();
+        let tokens = estimated_tokens(&content);
+        if tokens > remaining {
+            continue;
+        }
+        remaining -= tokens;
+        selected.push(ChatMessage {
+            role: message.role.clone(),
+            content,
+        });
+    }
+    selected.reverse();
+    while selected
+        .first()
+        .is_some_and(|message| message.role == "assistant")
+    {
+        selected.remove(0);
+    }
+    selected
 }
 
 fn timestamp(value: i64) -> String {
@@ -1677,6 +1937,15 @@ mod tests {
 
     #[test]
     fn activity_query_text_resolves_follow_up_subjects_from_recent_context() {
+        let thread_context = |subject: &str| ThreadContext {
+            version: 1,
+            subject: subject.into(),
+            signal_count: 38,
+            apps: vec!["Google Chrome".into()],
+            observed_from: None,
+            observed_through: None,
+            events: vec![],
+        };
         let history = vec![ChatMessage {
             role: "user".into(),
             content: "Tell me about Snowflake.".into(),
@@ -1686,21 +1955,80 @@ mod tests {
             "How long have I worked on it? Tell me about Snowflake."
         );
         assert_eq!(
-            activity_query_text(
-                "How long on this?",
-                &[],
-                Some("Context brief: Snowflake\n\n38 local signals."),
+            memory_query_text("How long have I worked on it?", None),
+            "How long have I worked on it?"
+        );
+        assert_eq!(
+            memory_query_text(
+                "What next?",
+                Some(&thread_context("Authorization: Bearer local-secret")),
             ),
+            "What next?"
+        );
+        assert_eq!(
+            activity_query_text("How long on this?", &[], Some(&thread_context("Snowflake")),),
             "How long on this? Snowflake"
+        );
+        assert_eq!(
+            activity_query_text("What next?", &[], Some(&thread_context("Snowflake"))),
+            "What next? Snowflake"
         );
         assert_eq!(
             activity_query_text(
                 "How long on this Snowflake project?",
                 &history,
-                Some("Context brief: BigQuery"),
+                Some(&thread_context("BigQuery")),
             ),
             "How long on this Snowflake project?"
         );
+    }
+
+    #[test]
+    fn bounded_chat_history_limits_messages_characters_and_tokens() {
+        let messages = vec![
+            UiChatMessage {
+                role: "assistant".into(),
+                content: "Ask anything. I’ll retrieve only approved memories.".into(),
+            },
+            UiChatMessage {
+                role: "user".into(),
+                content: "old ".repeat(2_000),
+            },
+            UiChatMessage {
+                role: "assistant".into(),
+                content: "old answer ".repeat(1_000),
+            },
+            UiChatMessage {
+                role: "user".into(),
+                content: "recent question".into(),
+            },
+            UiChatMessage {
+                role: "assistant".into(),
+                content: "recent answer".into(),
+            },
+        ];
+
+        let history = bounded_chat_history(&messages, 100);
+        let total_tokens = history
+            .iter()
+            .map(|message| estimated_tokens(&message.content))
+            .sum::<i64>();
+
+        assert!(history.len() <= 8);
+        assert!(history
+            .iter()
+            .all(|message| message.content.chars().count() <= MAX_CHAT_HISTORY_MESSAGE_CHARS));
+        assert!(total_tokens <= 100);
+        assert_ne!(
+            history.first().map(|message| message.role.as_str()),
+            Some("assistant")
+        );
+        assert!(history
+            .iter()
+            .all(|message| !is_synthetic_welcome(&UiChatMessage {
+                role: message.role.clone(),
+                content: message.content.clone(),
+            })));
     }
 
     #[test]
@@ -1825,6 +2153,46 @@ mod tests {
     }
 
     #[test]
+    fn application_names_are_trimmed_for_native_launching() {
+        assert_eq!(
+            normalized_application_name("  Visual Studio Code  ")
+                .expect("ordinary recorded app names should be accepted"),
+            "Visual Studio Code"
+        );
+        assert_eq!(
+            normalized_application_name("Safari")
+                .expect("single-word application names should be accepted"),
+            "Safari"
+        );
+        assert_eq!(
+            normalized_application_name("Code")
+                .expect("recorded application aliases should resolve to installed app names"),
+            "Visual Studio Code"
+        );
+    }
+
+    #[test]
+    fn application_names_reject_empty_control_and_path_like_values() {
+        for value in [
+            "",
+            "   ",
+            "\nSafari",
+            "Finder\nCalculator",
+            "../../Calculator",
+            r"Applications\Calculator",
+            "-W",
+            ".",
+            "..",
+        ] {
+            assert!(
+                normalized_application_name(value).is_err(),
+                "{value:?} should be rejected"
+            );
+        }
+        assert!(normalized_application_name(&"a".repeat(129)).is_err());
+    }
+
+    #[test]
     fn activity_ui_prefers_semantic_subject_and_includes_search_evidence() {
         let event = ActivityEvent {
             id: Some(42),
@@ -1841,10 +2209,12 @@ mod tests {
             is_bootstrap: false,
         };
 
-        let value = activity_to_ui_with_topic(event, Some("Snowflake"));
+        let modified_files = vec!["src/main.rs".to_string()];
+        let value = activity_to_ui_with_topic(event, Some("Snowflake"), &modified_files);
 
         assert_eq!(value["topic"], "Snowflake");
         assert_eq!(value["searchQuery"], "snowflake architecture");
+        assert_eq!(value["modifiedFiles"], json!(["src/main.rs"]));
     }
 
     #[test]

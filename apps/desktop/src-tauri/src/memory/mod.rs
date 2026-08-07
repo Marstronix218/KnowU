@@ -12,34 +12,13 @@ use crate::{
 };
 
 const DEFAULT_BASE_URL: &str = "https://api.evermind.ai";
-const DEFAULT_APP_ID: &str = "knowu";
-const DEFAULT_PROJECT_ID: &str = "knowu-hackathon";
 const APPROVED_MEMORY_SESSION: &str = "knowu-approved-memories";
+const MEMORY_ADD_PATH: &str = "/api/v1/memories";
+const MEMORY_FLUSH_PATH: &str = "/api/v1/memories/flush";
+const MEMORY_SEARCH_PATH: &str = "/api/v1/memories/search";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 type MemoryFuture<'a, T> = Pin<Box<dyn Future<Output = AppResult<T>> + Send + 'a>>;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum EverOSApiVersion {
-    V1,
-    V2,
-}
-
-impl EverOSApiVersion {
-    fn from_env_value(value: Option<&str>) -> Self {
-        match value.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
-            Some("1" | "v1") => Self::V1,
-            _ => Self::V2,
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::V1 => "v1 compatibility mode",
-            Self::V2 => "v2",
-        }
-    }
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -83,11 +62,8 @@ pub trait MemoryService {
 pub struct EverOSMemoryService {
     http: Client,
     api_key: Option<String>,
-    api_version: EverOSApiVersion,
     base_url: String,
     user_id: String,
-    app_id: String,
-    project_id: String,
 }
 
 impl Default for EverOSMemoryService {
@@ -105,26 +81,17 @@ impl EverOSMemoryService {
                 .build()
                 .expect("EverOS HTTP client"),
             api_key: non_empty_env("EVEROS_API_KEY"),
-            api_version: EverOSApiVersion::from_env_value(
-                non_empty_env("EVEROS_API_VERSION").as_deref(),
-            ),
             base_url: non_empty_env("EVEROS_BASE_URL")
                 .unwrap_or_else(|| DEFAULT_BASE_URL.into())
                 .trim_end_matches('/')
                 .into(),
             user_id: non_empty_env("EVEROS_USER_ID").unwrap_or_else(|| "knowu-local-user".into()),
-            app_id: non_empty_env("EVEROS_APP_ID").unwrap_or_else(|| DEFAULT_APP_ID.into()),
-            project_id: non_empty_env("EVEROS_PROJECT_ID")
-                .unwrap_or_else(|| DEFAULT_PROJECT_ID.into()),
         }
     }
 
     pub fn configuration_message(&self) -> String {
         if self.is_configured() {
-            format!(
-                "EverOS {} is configured for approved persistent memories.",
-                self.api_version.label()
-            )
+            "EverOS v1 is configured for approved persistent memories.".into()
         } else {
             "Set EVEROS_API_KEY to enable persistent EverOS memory. KnowU will use safe local profile memories until then.".into()
         }
@@ -160,30 +127,10 @@ impl EverOSMemoryService {
                 message: "No approved memories needed syncing.".into(),
             });
         }
-        match self.api_version {
-            EverOSApiVersion::V1 => {
-                self.post("/api/v1/memories", v1_add_request(memories, &self.user_id))
-                    .await?;
-                self.post("/api/v1/memories/flush", v1_flush_request(&self.user_id))
-                    .await?;
-            }
-            EverOSApiVersion::V2 => {
-                self.post(
-                    "/api/v2/memory/add",
-                    v2_add_request(memories, &self.user_id, &self.app_id, &self.project_id),
-                )
-                .await?;
-                self.post(
-                    "/api/v2/memory/flush",
-                    json!({
-                        "session_id":APPROVED_MEMORY_SESSION,
-                        "app_id":self.app_id,
-                        "project_id":self.project_id
-                    }),
-                )
-                .await?;
-            }
-        }
+        self.post(MEMORY_ADD_PATH, v1_add_request(memories, &self.user_id))
+            .await?;
+        self.post(MEMORY_FLUSH_PATH, v1_flush_request(&self.user_id))
+            .await?;
         Ok(MemoryWriteReceipt {
             provider: "everos".into(),
             stored_count: memories.len(),
@@ -195,17 +142,12 @@ impl EverOSMemoryService {
         if query.trim().is_empty() {
             return Ok(vec![]);
         }
-        let (path, request) = match self.api_version {
-            EverOSApiVersion::V1 => (
-                "/api/v1/memories/search",
+        let response = self
+            .post(
+                MEMORY_SEARCH_PATH,
                 v1_search_request(query, limit, &self.user_id),
-            ),
-            EverOSApiVersion::V2 => (
-                "/api/v2/memory/search",
-                v2_search_request(query, limit, &self.user_id, &self.app_id, &self.project_id),
-            ),
-        };
-        let response = self.post(path, request).await?;
+            )
+            .await?;
         Ok(parse_search_response(&response, limit))
     }
 }
@@ -407,41 +349,6 @@ fn v1_search_request(query: &str, limit: usize, user_id: &str) -> Value {
     })
 }
 
-fn v2_add_request(
-    memories: &[MemoryRecord],
-    user_id: &str,
-    app_id: &str,
-    project_id: &str,
-) -> Value {
-    json!({
-        "session_id":APPROVED_MEMORY_SESSION,
-        "messages":encoded_messages(memories, user_id),
-        "app_id":app_id,
-        "project_id":project_id,
-        "mode":"chat",
-        "async_mode":false
-    })
-}
-
-fn v2_search_request(
-    query: &str,
-    limit: usize,
-    user_id: &str,
-    app_id: &str,
-    project_id: &str,
-) -> Value {
-    json!({
-        "query":query.trim(),
-        "app_id":app_id,
-        "project_id":project_id,
-        "user_id":user_id,
-        "method":"hybrid",
-        "top_k":limit.max(1),
-        "include_profile":true,
-        "filters":{"session_id":APPROVED_MEMORY_SESSION}
-    })
-}
-
 fn to_everos_timestamp_millis(timestamp_seconds: i64) -> i64 {
     timestamp_seconds.saturating_mul(1_000)
 }
@@ -498,10 +405,7 @@ fn parse_search_response(value: &Value, limit: usize) -> Vec<MemoryRecord> {
             }
         }
     }
-    if let Some(messages) = data["unprocessed_messages"]
-        .as_array()
-        .or_else(|| data["raw_messages"].as_array())
-    {
+    if let Some(messages) = data["raw_messages"].as_array() {
         for message in messages {
             let created_at = parse_everos_timestamp(&message["timestamp"]);
             push_parsed(
@@ -580,9 +484,6 @@ fn everos_status_error(status: StatusCode, body: &Value) -> AppError {
         .unwrap_or_default();
     let message = match status.as_u16() {
         401 => "EverOS rejected the API key.",
-        403 if body["error"]["code"].as_str() == Some("VERSION_NOT_ALLOWED") => {
-            "This EverOS account is not enabled for the v2 Memory API."
-        }
         403 => "EverOS denied the memory request.",
         429 => "EverOS rate limit reached.",
         500..=599 => "EverOS is temporarily unavailable.",
@@ -597,20 +498,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn api_version_defaults_to_v2_and_accepts_v1_compatibility_mode() {
-        assert_eq!(EverOSApiVersion::from_env_value(None), EverOSApiVersion::V2);
-        assert_eq!(
-            EverOSApiVersion::from_env_value(Some("v1")),
-            EverOSApiVersion::V1
-        );
-        assert_eq!(
-            EverOSApiVersion::from_env_value(Some("1")),
-            EverOSApiVersion::V1
-        );
+    fn everos_uses_v1_memory_paths() {
+        assert_eq!(MEMORY_ADD_PATH, "/api/v1/memories");
+        assert_eq!(MEMORY_FLUSH_PATH, "/api/v1/memories/flush");
+        assert_eq!(MEMORY_SEARCH_PATH, "/api/v1/memories/search");
     }
 
     #[test]
-    fn v1_requests_use_documented_personal_memory_contract() {
+    fn v1_add_request_matches_contract() {
         let memories = vec![memory(
             "preference",
             "explicit_user",
@@ -619,59 +514,51 @@ mod tests {
         )];
 
         let add = v1_add_request(&memories, "user-1");
-        assert_eq!(add["user_id"], "user-1");
-        assert_eq!(add["session_id"], APPROVED_MEMORY_SESSION);
-        assert_eq!(add["async_mode"], false);
-        assert_eq!(add["messages"][0]["sender_id"], "user-1");
-        assert_eq!(add["messages"][0]["timestamp"], 1_754_563_200_000_i64);
+        assert_eq!(
+            add,
+            json!({
+                "user_id":"user-1",
+                "session_id":APPROVED_MEMORY_SESSION,
+                "messages":[{
+                    "sender_id":"user-1",
+                    "role":"user",
+                    "timestamp":1_754_563_200_000_i64,
+                    "content":"KnowU approved memory [type=preference; source=explicit_user]: Privacy first."
+                }],
+                "async_mode":false
+            })
+        );
+    }
 
+    #[test]
+    fn v1_flush_request_matches_contract() {
         let flush = v1_flush_request("user-1");
-        assert_eq!(flush["user_id"], "user-1");
-        assert_eq!(flush["session_id"], APPROVED_MEMORY_SESSION);
+        assert_eq!(
+            flush,
+            json!({
+                "user_id":"user-1",
+                "session_id":APPROVED_MEMORY_SESSION
+            })
+        );
+    }
 
+    #[test]
+    fn v1_search_request_matches_contract() {
         let search = v1_search_request("  privacy preferences  ", 5, "user-1");
-        assert_eq!(search["query"], "privacy preferences");
-        assert_eq!(search["filters"]["user_id"], "user-1");
-        assert_eq!(search["filters"]["session_id"], APPROVED_MEMORY_SESSION);
-        assert_eq!(search["top_k"], 5);
-        assert_eq!(search["memory_types"][2], "raw_message");
-    }
-
-    #[test]
-    fn v2_add_request_uses_documented_contract_and_millisecond_timestamps() {
-        let memories = vec![memory(
-            "preference",
-            "explicit_user",
-            "Privacy first.",
-            1_754_563_200,
-        )];
-
-        let request = v2_add_request(&memories, "user-1", "knowu", "project-1");
-
-        assert_eq!(request["session_id"], APPROVED_MEMORY_SESSION);
-        assert_eq!(request["app_id"], "knowu");
-        assert_eq!(request["project_id"], "project-1");
-        assert_eq!(request["mode"], "chat");
-        assert_eq!(request["async_mode"], false);
-        assert_eq!(request["messages"][0]["sender_id"], "user-1");
-        assert_eq!(request["messages"][0]["role"], "user");
-        assert_eq!(request["messages"][0]["timestamp"], 1_754_563_200_000_i64);
-    }
-
-    #[test]
-    fn search_request_uses_one_owner_and_pins_the_unprocessed_session() {
-        let request =
-            v2_search_request("  privacy preferences  ", 5, "user-1", "knowu", "project-1");
-
-        assert_eq!(request["query"], "privacy preferences");
-        assert_eq!(request["user_id"], "user-1");
-        assert!(request.get("agent_id").is_none());
-        assert_eq!(request["method"], "hybrid");
-        assert_eq!(request["top_k"], 5);
-        assert_eq!(request["include_profile"], true);
-        assert_eq!(request["filters"]["session_id"], APPROVED_MEMORY_SESSION);
-        assert_eq!(request["app_id"], "knowu");
-        assert_eq!(request["project_id"], "project-1");
+        assert_eq!(
+            search,
+            json!({
+                "query":"privacy preferences",
+                "filters":{
+                    "user_id":"user-1",
+                    "session_id":APPROVED_MEMORY_SESSION
+                },
+                "method":"hybrid",
+                "memory_types":["episodic_memory", "profile", "raw_message"],
+                "top_k":5,
+                "include_original_data":false
+            })
+        );
     }
 
     #[test]
@@ -693,21 +580,6 @@ mod tests {
     }
 
     #[test]
-    fn parses_unprocessed_message_millisecond_timestamps() {
-        let result = parse_search_response(
-            &json!({"data":{"unprocessed_messages":[{
-                "id":"message-1",
-                "timestamp":1_754_563_200_000_i64,
-                "content":"KnowU approved memory [type=project; source=approved_profile]: Ship KnowU."
-            }]}}),
-            3,
-        );
-
-        assert_eq!(result[0].created_at, 1_754_563_200);
-        assert_eq!(result[0].text, "Ship KnowU.");
-    }
-
-    #[test]
     fn parses_v1_raw_messages() {
         let result = parse_search_response(
             &json!({"data":{"raw_messages":[{
@@ -723,7 +595,7 @@ mod tests {
     }
 
     #[test]
-    fn surfaces_nested_v2_validation_errors() {
+    fn surfaces_nested_provider_errors() {
         let error = everos_status_error(
             StatusCode::UNPROCESSABLE_ENTITY,
             &json!({"error":{"code":"invalid_argument","message":"exactly one owner is required"}}),

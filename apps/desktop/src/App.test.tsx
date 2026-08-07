@@ -33,6 +33,12 @@ function chatRun(message: ChatMessage): ChatRunResult {
       outputTokens: 50,
       latencyMs: 400,
       memoryCount: 1,
+      contextBudgetTokens: 3000,
+      contextEstimatedTokens: 250,
+      contextUnitsConsidered: 6,
+      contextUnitsSent: 6,
+      contextUnitsOmitted: 0,
+      contextDetailLevel: "selected-event-metadata",
       measurementMethod: "provider_usage_scaled_estimate",
       telemetryStatus: "synced-to-snowflake",
       baselineContextPreview: "Full approved profile context",
@@ -50,6 +56,7 @@ function stubApi() {
   localStorage.removeItem("knowu.selected-thread");
   vi.spyOn(api, "settings").mockResolvedValue(clone(mockSettings));
   vi.spyOn(api, "openResource").mockResolvedValue(undefined);
+  vi.spyOn(api, "openApplication").mockResolvedValue(undefined);
   vi.spyOn(api, "dashboard").mockResolvedValue(clone(mockDashboard));
   vi.spyOn(api, "activity").mockResolvedValue(clone(mockDashboard.recentActivity));
   vi.spyOn(api, "profile").mockResolvedValue(clone(mockProfile));
@@ -103,6 +110,14 @@ function previewEvent(
     topic: "Classical music",
     source: url ? "history" : "collector",
   };
+}
+
+function editorActivity(): ActivityEvent[] {
+  return [
+    { id: "editor-1", appName: "Visual Studio Code", pageTitle: "src/App.tsx", windowTitle: "KnowU — src/App.tsx", startedAt: "2026-08-07T18:00:00.000Z", durationSeconds: 0, topic: "Software development", source: "editor" },
+    { id: "editor-2", appName: "Visual Studio Code", pageTitle: "src/App.tsx", windowTitle: "KnowU — src/App.tsx", startedAt: "2026-08-07T17:45:00.000Z", durationSeconds: 0, topic: "Software development", source: "editor" },
+    { id: "editor-3", appName: "Visual Studio Code", pageTitle: "src/App.css", windowTitle: "KnowU — src/App.css", startedAt: "2026-08-07T17:30:00.000Z", durationSeconds: 0, topic: "Software development", source: "editor" },
+  ];
 }
 
 describe("application navigation", () => {
@@ -176,6 +191,7 @@ describe("dashboard", () => {
 
     await waitFor(() => {
       expect(api.openResource).toHaveBeenCalledWith("https://v2.tauri.app/security/capabilities/");
+      expect(api.openApplication).not.toHaveBeenCalled();
       expect(screen.getByRole("status")).toHaveTextContent("Opened the latest available resource.");
     });
   });
@@ -187,6 +203,75 @@ describe("dashboard", () => {
     fireEvent.click(await screen.findByRole("button", { name: /Resume thread/ }));
 
     expect(await screen.findByText("Could not open the latest available resource.")).toBeInTheDocument();
+  });
+
+  it("opens the most recent local application when the thread has no web resource", async () => {
+    dashboardWithPreviewEvents(editorActivity());
+    await renderRoute("#/dashboard");
+
+    fireEvent.click(await screen.findByRole("button", { name: /Resume thread/ }));
+
+    await waitFor(() => {
+      expect(api.openResource).not.toHaveBeenCalled();
+      expect(api.openApplication).toHaveBeenCalledWith("Visual Studio Code");
+      expect(screen.getByRole("status")).toHaveTextContent("Opened Visual Studio Code.");
+    });
+  });
+
+  it("skips a non-reopenable URL and falls back to its local application", async () => {
+    dashboardWithPreviewEvents([{
+      id: "local-file",
+      appName: "Visual Studio Code",
+      pageTitle: "src/App.tsx",
+      url: "file:///Users/nori/Desktop/KnowU/apps/desktop/src/App.tsx",
+      startedAt: "2026-08-07T18:00:00.000Z",
+      durationSeconds: 300,
+      topic: "Classical music",
+      source: "collector",
+    }]);
+    await renderRoute("#/dashboard");
+
+    fireEvent.click(await screen.findByRole("button", { name: /Resume thread/ }));
+
+    await waitFor(() => {
+      expect(api.openResource).not.toHaveBeenCalled();
+      expect(api.openApplication).toHaveBeenCalledWith("Visual Studio Code");
+      expect(screen.getByRole("status")).toHaveTextContent("Opened Visual Studio Code.");
+    });
+  });
+
+  it("reports when the most recent local application cannot be opened", async () => {
+    dashboardWithPreviewEvents(editorActivity());
+    vi.mocked(api.openApplication).mockRejectedValueOnce(new Error("open failed"));
+    await renderRoute("#/dashboard");
+
+    fireEvent.click(await screen.findByRole("button", { name: /Resume thread/ }));
+
+    await waitFor(() => {
+      expect(api.openApplication).toHaveBeenCalledWith("Visual Studio Code");
+      expect(screen.getByRole("status")).toHaveTextContent("Could not open Visual Studio Code.");
+    });
+  });
+
+  it("keeps the context brief fallback when there is no meaningful resume target", async () => {
+    vi.mocked(api.dashboard).mockResolvedValue({
+      ...clone(mockDashboard),
+      activeTopics: [{ name: "Classical music", count: 1 }],
+      recentActivity: [{
+        ...previewEvent("no-target", "2026-08-07T18:00:00.000Z", undefined),
+        appName: "KnowU",
+      }],
+      recommendations: [],
+    });
+    await renderRoute("#/dashboard");
+
+    fireEvent.click(await screen.findByRole("button", { name: /Resume thread/ }));
+
+    expect(await screen.findByRole("status")).toHaveTextContent(
+      "No reopenable resource or local application is available. The context brief is ready to use.",
+    );
+    expect(api.openResource).not.toHaveBeenCalled();
+    expect(api.openApplication).not.toHaveBeenCalled();
   });
 
   it("lists reconstructed work threads and their evidence boundary", async () => {
@@ -270,6 +355,75 @@ describe("dashboard", () => {
     fireEvent.click(await screen.findByRole("button", { name: "7 days" }));
 
     await waitFor(() => expect(dashboardSpy).toHaveBeenCalledWith("7d"));
+  });
+
+  it("shows modified-file context beside the editor app in Now evidence", async () => {
+    await renderRoute("#/dashboard");
+
+    expect(await screen.findAllByText(/Visual Studio Code · Modified App\.tsx ·/)).not.toHaveLength(0);
+  });
+});
+
+describe("editor file changes", () => {
+  beforeEach(stubApi);
+
+  it("shows recent workspace changes when Code activity has no window metadata", async () => {
+    vi.mocked(api.activity).mockResolvedValue([{
+      id: "code-without-title",
+      appName: "Code",
+      startedAt: "2026-08-07T18:00:00.000Z",
+      durationSeconds: 120,
+      modifiedFiles: ["apps/desktop/src/App.tsx", "apps/desktop/src/App.css"],
+      topic: "Software development",
+      source: "collector",
+    }]);
+
+    await renderRoute("#/activity");
+
+    expect(await screen.findByText("Code · Changed App.tsx, App.css")).toBeInTheDocument();
+  });
+
+  it("summarizes saved VS Code files in the activity timeline", async () => {
+    const focusedEditorActivity: ActivityEvent = {
+      id: "editor-focus",
+      appName: "Visual Studio Code",
+      windowTitle: "KnowU — App.tsx",
+      startedAt: "2026-08-07T17:20:00.000Z",
+      durationSeconds: 3_000,
+      topic: "Software development",
+      source: "collector",
+    };
+    vi.mocked(api.activity).mockResolvedValue([focusedEditorActivity, ...editorActivity()]);
+
+    await renderRoute("#/activity");
+
+    const summary = await screen.findByRole("region", { name: "Saved files" });
+    expect(within(summary).getByText("2 files · 3 saves")).toBeInTheDocument();
+    expect(within(summary).getByText("src/App.tsx")).toBeInTheDocument();
+    expect(within(summary).getByText("src/App.css")).toBeInTheDocument();
+    expect(within(summary).getByText(/does not read code or compute line diffs/i)).toBeInTheDocument();
+    expect(screen.getAllByText("file save")).toHaveLength(3);
+    expect(screen.getByText("Visual Studio Code · Modified App.tsx, App.css")).toBeInTheDocument();
+    expect(screen.getAllByText("Visual Studio Code · Modified App.tsx")).toHaveLength(2);
+    expect(screen.getByText("Visual Studio Code · Modified App.css")).toBeInTheDocument();
+  });
+
+  it("shows saved files inside Software Development thread evidence", async () => {
+    const events = editorActivity().map((event) => ({ ...event, topic: "KnowU implementation" }));
+    vi.mocked(api.dashboard).mockResolvedValue({
+      ...clone(mockDashboard),
+      activeTopics: [{ name: "Software development", count: events.length }],
+      recentActivity: events,
+      recommendations: [],
+    });
+
+    await renderRoute("#/threads");
+    fireEvent.click(await screen.findByRole("button", { name: /Software development/i }));
+
+    const summary = await screen.findByRole("region", { name: "Saved files" });
+    expect(within(summary).getByText("2 files · 3 saves")).toBeInTheDocument();
+    expect(within(summary).getByText("src/App.tsx")).toBeInTheDocument();
+    expect(within(summary).getByText("src/App.css")).toBeInTheDocument();
   });
 });
 
@@ -455,9 +609,10 @@ describe("settings privacy disclosures", () => {
 
     expect(
       await screen.findByText(
-        "Foreground app, window title, selected Chrome history, and editor file-save metadata.",
+        "Foreground app, window title, selected Chrome history, and editor workspace-change metadata.",
       ),
     ).toBeInTheDocument();
+    expect(screen.getByText(/Git working-tree paths/i)).toBeInTheDocument();
     expect(
       screen.getByText(/never opens saved code snapshots or source contents/i),
     ).toBeInTheDocument();
@@ -545,7 +700,7 @@ describe("assistant chat", () => {
     expect(screen.getByText(/QUERY-SPECIFIC LOCAL ACTIVITY FACTS/)).toBeInTheDocument();
   });
 
-  it("passes the selected thread as an inspectable provisional context brief", async () => {
+  it("passes the selected thread as inspectable local candidate evidence", async () => {
     const response: ChatMessage = {
       id: "context-response",
       role: "assistant",
@@ -556,19 +711,25 @@ describe("assistant chat", () => {
     await renderRoute("#/dashboard");
 
     fireEvent.click(await screen.findByRole("link", { name: /Ask with context/ }));
-    expect(await screen.findByText("Review high-level thread brief")).toBeInTheDocument();
+    expect(await screen.findByText("Review local candidate evidence")).toBeInTheDocument();
     fireEvent.change(screen.getByPlaceholderText(/What should I prioritize/), { target: { value: "What next?" } });
     fireEvent.click(screen.getByRole("button", { name: /Send/ }));
 
     await waitFor(() => expect(chat).toHaveBeenCalledOnce());
     const sentMessages = chat.mock.calls[0][0];
     expect(sentMessages[sentMessages.length - 1]?.content).toBe("What next?");
-    expect(chat.mock.calls[0][2]).toContain("Context brief: KnowU implementation");
-    expect(chat.mock.calls[0][2]).toContain("Treat this as provisional behavioral context");
-    expect(chat.mock.calls[0][2]).toContain("Duration is omitted here");
-    expect(chat.mock.calls[0][2]).not.toContain("Recorded duration");
-    expect(chat.mock.calls[0][2]).not.toContain("Tauri 2 — Security Capabilities");
-    expect(chat.mock.calls[0][2]).not.toContain("https://");
+    expect(chat.mock.calls[0][2]).toMatchObject({
+      version: 1,
+      subject: "KnowU implementation",
+      signalCount: expect.any(Number),
+    });
+    expect(chat.mock.calls[0][2]?.events[0]).toMatchObject({
+      appName: expect.any(String),
+      source: expect.any(String),
+    });
+    expect(chat.mock.calls[0][2]?.events.some((event) => event.title === "Tauri 2 — Security Capabilities")).toBe(true);
+    expect(chat.mock.calls[0][2]?.events.some((event) => event.resource === "v2.tauri.app/security/capabilities/")).toBe(true);
+    expect(chat.mock.calls[0][2]?.events.every((event) => !event.resource?.includes("?"))).toBe(true);
   });
 
   it("sends a message when Enter is pressed", async () => {

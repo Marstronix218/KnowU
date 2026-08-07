@@ -85,6 +85,17 @@ CREATE TABLE inference_runs (
 );
 CREATE INDEX inference_runs_time_idx ON inference_runs(timestamp DESC);
 "#,
+    r#"
+ALTER TABLE inference_runs ADD COLUMN context_budget_tokens INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE inference_runs ADD COLUMN context_estimated_tokens INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE inference_runs ADD COLUMN context_units_considered INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE inference_runs ADD COLUMN context_units_sent INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE inference_runs ADD COLUMN context_units_omitted INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE inference_runs ADD COLUMN context_detail_level TEXT NOT NULL DEFAULT 'legacy';
+ALTER TABLE inference_runs ADD COLUMN provider_preflight_input_tokens INTEGER;
+ALTER TABLE inference_runs ADD COLUMN cache_read_input_tokens INTEGER;
+ALTER TABLE inference_runs ADD COLUMN cache_write_input_tokens INTEGER;
+"#,
 ];
 
 pub struct Database {
@@ -779,9 +790,13 @@ impl Database {
         self.conn().execute(
             "INSERT OR REPLACE INTO inference_runs
              (id,timestamp,model,baseline_input_tokens,optimized_input_tokens,tokens_saved,
-              reduction_percent,actual_input_tokens,output_tokens,latency_ms,estimated_cost_usd,
+              reduction_percent,actual_input_tokens,output_tokens,context_budget_tokens,
+              context_estimated_tokens,context_units_considered,context_units_sent,
+              context_units_omitted,context_detail_level,provider_preflight_input_tokens,
+              cache_read_input_tokens,cache_write_input_tokens,latency_ms,estimated_cost_usd,
               memory_count,mode,memory_provider,measurement_method,snowflake_synced,analytics_error)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,
+                    ?19,?20,?21,?22,?23,?24,?25,?26)",
             params![
                 run.id,
                 run.timestamp,
@@ -792,6 +807,15 @@ impl Database {
                 run.reduction_percent,
                 run.actual_input_tokens,
                 run.output_tokens,
+                run.context_budget_tokens,
+                run.context_estimated_tokens,
+                run.context_units_considered,
+                run.context_units_sent,
+                run.context_units_omitted,
+                run.context_detail_level,
+                run.provider_preflight_input_tokens,
+                run.cache_read_input_tokens,
+                run.cache_write_input_tokens,
                 run.latency_ms,
                 run.estimated_cost_usd,
                 run.memory_count,
@@ -1166,6 +1190,134 @@ mod tests {
             source: ActivitySource::AppFocus,
             is_bootstrap: bootstrap,
         }
+    }
+
+    #[test]
+    fn inference_run_persists_context_economics_telemetry() {
+        let db = Database::in_memory().unwrap();
+        let run = InferenceRun {
+            id: "run-context-1".into(),
+            timestamp: "2026-08-07T12:00:00Z".into(),
+            model: "test-model".into(),
+            baseline_input_tokens: 200,
+            optimized_input_tokens: 120,
+            tokens_saved: 80,
+            reduction_percent: 40.0,
+            actual_input_tokens: Some(125),
+            output_tokens: Some(20),
+            context_budget_tokens: 160,
+            context_estimated_tokens: 110,
+            context_units_considered: 30,
+            context_units_sent: 18,
+            context_units_omitted: 12,
+            context_detail_level: "detailed".into(),
+            provider_preflight_input_tokens: Some(128),
+            cache_read_input_tokens: Some(48),
+            cache_write_input_tokens: Some(16),
+            latency_ms: 40,
+            estimated_cost_usd: Some(0.02),
+            memory_count: 6,
+            mode: "optimized".into(),
+            memory_provider: "local".into(),
+            measurement_method: "test".into(),
+        };
+
+        db.record_inference_run(&run, true, None).unwrap();
+
+        let persisted = db
+            .conn()
+            .query_row(
+                "SELECT context_budget_tokens, context_estimated_tokens,
+                        context_units_considered, context_units_sent, context_units_omitted,
+                        context_detail_level, provider_preflight_input_tokens,
+                        cache_read_input_tokens, cache_write_input_tokens
+                 FROM inference_runs WHERE id=?1",
+                [&run.id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, Option<i64>>(6)?,
+                        row.get::<_, Option<i64>>(7)?,
+                        row.get::<_, Option<i64>>(8)?,
+                    ))
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            persisted,
+            (
+                160,
+                110,
+                30,
+                18,
+                12,
+                "detailed".into(),
+                Some(128),
+                Some(48),
+                Some(16)
+            )
+        );
+    }
+
+    #[test]
+    fn inference_run_migration_backfills_legacy_context_telemetry() {
+        let connection = Connection::open_in_memory().unwrap();
+        for (index, sql) in MIGRATIONS.iter().take(3).enumerate() {
+            connection.execute_batch(sql).unwrap();
+            connection
+                .pragma_update(None, "user_version", index + 1)
+                .unwrap();
+        }
+        connection
+            .execute(
+                "INSERT INTO inference_runs
+                 (id,timestamp,model,baseline_input_tokens,optimized_input_tokens,tokens_saved,
+                  reduction_percent,latency_ms,memory_count,mode,memory_provider,
+                  measurement_method)
+                 VALUES('legacy-run','2026-08-06T12:00:00Z','legacy-model',100,50,50,
+                        50.0,10,2,'optimized','local','legacy')",
+                [],
+            )
+            .unwrap();
+        let db = Database {
+            connection: Mutex::new(connection),
+            path: PathBuf::from(":memory:"),
+        };
+
+        db.migrate().unwrap();
+
+        let migrated = db
+            .conn()
+            .query_row(
+                "SELECT context_budget_tokens, context_estimated_tokens,
+                        context_units_considered, context_units_sent, context_units_omitted,
+                        context_detail_level, provider_preflight_input_tokens,
+                        cache_read_input_tokens, cache_write_input_tokens
+                 FROM inference_runs WHERE id='legacy-run'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, Option<i64>>(6)?,
+                        row.get::<_, Option<i64>>(7)?,
+                        row.get::<_, Option<i64>>(8)?,
+                    ))
+                },
+            )
+            .unwrap();
+
+        assert_eq!(migrated, (0, 0, 0, 0, 0, "legacy".into(), None, None, None));
     }
 
     #[test]

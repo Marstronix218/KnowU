@@ -72,7 +72,7 @@ The following table sets the boundary of the MVP. Items marked out of scope are 
 | In-app work-continuity and behavioral recommendations | Autonomous actions taken on the user's behalf |
 | Activity insights and topical/media summaries | Medical, mental-health, or productivity diagnosis |
 | Selection of one or more Chrome profiles during onboarding | Automatic ingestion from Chrome profiles the user did not select |
-| Bring-your-own OpenAI or Anthropic API key | KnowU-hosted LLM proxy, billing, or user accounts |
+| Bring-your-own OpenAI, Anthropic, or Amazon Bedrock API key | KnowU-hosted LLM proxy, billing, or user accounts |
 | User view + edit + delete of profile | Interruptive background notifications or coaching |
 | Single device, single user | Multi-device sync; cloud accounts |
 
@@ -101,7 +101,7 @@ This user is reachable, feels the problem acutely, and can evaluate the result. 
 7. **Activity insights.** The user sees understandable summaries such as time spent by topic, repeated research themes, focused-session length, and how many video pages or resources were active within a category.
 8. **Chrome profile consent.** During onboarding, the user sees the Chrome profiles available on the device and explicitly selects one or more profiles whose history KnowU may ingest.
 9. **Technical alpha setup.** A technical user installs a development-stage Mac build, loads or installs the companion Chrome extension, grants permissions, selects Chrome profiles, and connects their own LLM provider key.
-10. **Provider configuration.** The user selects OpenAI or Anthropic, enters an API key in the app, verifies the connection, and has the credential stored in macOS Keychain rather than in the activity database or a required `.env` file.
+10. **Provider configuration.** The user selects OpenAI, Anthropic, or Amazon Bedrock, enters an API key in the app, verifies the connection, and has the credential stored in macOS Keychain rather than in the activity database or a required `.env` file.
 
 ---
 
@@ -131,12 +131,12 @@ The application uses Tauri 2: React and TypeScript bundled with Vite for the int
 
 The technical-user alpha may use a development-stage Mac build and an unpacked Chrome extension installed through browser developer mode. Chrome Web Store publication, polished installers, Apple notarization, and consumer-grade installation are deferred until the behavioral-context hypothesis is validated. Setup documentation must nevertheless be explicit, reproducible, and honest about every permission.
 
-KnowU uses a bring-your-own-key model for the alpha. Users select OpenAI or Anthropic and enter their API key in the application settings. The packaged application stores the credential in macOS Keychain and uses it only for direct requests to the selected provider. A `.env` file may be supported for contributors running the source code, but it must not be required for normal alpha use.
+KnowU uses a bring-your-own-key model for the alpha. Users select OpenAI, Anthropic, or Amazon Bedrock and enter their API key in the application settings. The packaged application stores the credential in macOS Keychain and uses it only for direct requests to the selected provider. A `.env` file may be supported for contributors running the source code, but it must not be required for normal alpha use.
 
 ### 3.4 Data flow
 
 1. During setup, the technical user installs or loads the Chrome extension, grants required macOS permissions, and explicitly selects one or more detected Chrome profiles. Up to 90 days of browser history is imported only from the selected profiles into a temporary cold-start dataset.
-2. The user selects OpenAI or Anthropic, enters an API key in the Mac application, and verifies the connection. The application stores the key in macOS Keychain.
+2. The user selects OpenAI, Anthropic, or Amazon Bedrock, enters an API key in the Mac application, and verifies the connection. The application stores the key in macOS Keychain.
 3. The collector samples the foreground application and active window title at a fixed interval and records permitted browser-history additions, writing timestamped events to the local store.
 4. While Chrome is in use, the extension records active-tab URL, title, focus start time, and duration. It sends these metadata events only to the local Mac collector and does not read page content.
 5. The local collector deduplicates and reconciles live extension events with imported browser history.
@@ -231,7 +231,7 @@ Requirements are identified as FR-n. Priority is Must (required for MVP), Should
 
 | ID | Requirement | Priority |
 |---|---|---|
-| FR-44 | Let the user select a supported remote LLM provider, initially OpenAI or Anthropic. | Must |
+| FR-44 | Let the user select a supported remote LLM provider: OpenAI, Anthropic, or Amazon Bedrock. | Must |
 | FR-45 | Let the user enter, replace, validate, and remove their provider API key from the application settings. | Must |
 | FR-46 | Store provider API keys in macOS Keychain; never store them in the activity database, logs, analytics, Chrome extension, source control, or plaintext application configuration. | Must |
 | FR-47 | Send profiling and chat requests directly from the Mac application to the selected provider; do not route them through a KnowU-hosted proxy in the alpha. | Must |

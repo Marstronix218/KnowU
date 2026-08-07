@@ -24,17 +24,19 @@ query-complete answer path:
 
 1. **Full Context** is an unsent comparison baseline: the larger local profile,
    authoritative corrections, summarized activity, conversation, and optional
-   thread brief. It includes the same retrieved memories and query-specific
+   selected-thread packet. It includes the same retrieved memories and query-specific
    facts as the answer path, making the token comparison answer-equivalent.
-2. **KnowU Context** combines query-specific approved memories from EverOS with
-   compact activity facts computed locally from SQLite. It sends facts such as
-   first/last observation, de-overlapped live activity time, and evidence
-   counts—not raw activity rows.
-3. KnowU Context always produces the answer through the configured OpenAI or
-   Anthropic BYOK provider path. Full Context is comparison-only, so answer
-   correctness never depends on selecting a more expensive mode.
-4. KnowU displays the full/optimized input counts, tokens saved, reduction
-   percentage, retrieved memories, model, latency, and telemetry status.
+2. **KnowU Context** combines query-specific approved memories, compact local
+   aggregates, and sanitized metadata from an explicitly selected work thread.
+   A deterministic packer sends as much high-value evidence as fits the token
+   budget instead of reducing the thread to a generic four-line summary.
+3. KnowU Context produces the answer through the configured OpenAI, Anthropic,
+   or Amazon Bedrock BYOK provider. Bedrock uses model-specific `CountTokens`
+   preflight and eligible prompt-prefix caching. Full Context remains
+   comparison-only.
+4. KnowU displays the full/optimized input counts, context budget and unit
+   inclusion, cache tokens, retrieved memories, model, latency, and telemetry
+   status.
 5. Aggregate inference-run metrics are persisted locally and synced to
    Snowflake when configured.
 
@@ -46,6 +48,8 @@ QUESTION
 EVEROS RELEVANT MEMORIES
    +
 LOCAL QUERY-SPECIFIC FACTS
+   +
+TOKEN-BUDGETED SELECTED-THREAD EVIDENCE
    ↓
 ANSWER
    +
@@ -60,10 +64,10 @@ React/Vite UI
       ├─ local SQLite activity/profile store
       ├─ context builders
       │   ├─ baseline: profile + safe summaries
-      │   └─ answer: query-specific memories + compact local facts
+      │   └─ answer: token-budgeted memories + facts + selected evidence
       ├─ MemoryService
-      │   └─ EverOSMemoryService → EverOS Memory API v2
-      ├─ OpenAI / Anthropic BYOK provider
+      │   └─ EverOSMemoryService → EverOS Personal Memory API v1
+      ├─ OpenAI / Anthropic / Amazon Bedrock BYOK provider
       └─ SnowflakeAnalyticsService → Snowflake SQL API
           ├─ INFERENCE_RUNS
           └─ CONTEXT_ECONOMICS_SUMMARY
@@ -71,7 +75,7 @@ React/Vite UI
 
 Key implementation locations:
 
-- `apps/desktop/src-tauri/src/memory/mod.rs` — memory abstraction, EverOS v2
+- `apps/desktop/src-tauri/src/memory/mod.rs` — memory abstraction, EverOS v1
   add/flush/search, safe local fallback, profile ingestion, and demo seed.
 - `apps/desktop/src-tauri/src/context.rs` — baseline and optimized builders.
 - `apps/desktop/src-tauri/src/analytics/mod.rs` — token measurement and
@@ -94,11 +98,14 @@ sources:
 - macOS foreground application and permitted window-title sessions
 - selected Chrome profile history, automatically backfilled about every 30
   seconds after the database changes
-- metadata-only Local History save signals from Visual Studio Code, Cursor,
-  and Cortex Code, without requiring an editor extension
+- metadata-only Local History save signals and recent Git working-tree paths
+  from Visual Studio Code, Cursor, and Cortex Code workspaces, without requiring
+  an editor extension
 
 The editor collector stores only the editor, workspace-relative path, and save
-timestamp. It never opens source files or saved Local History snapshots. This
+timestamp. When Local History or window titles are unavailable, the UI may
+derive recent changed paths from Git metadata in the most recently active local
+workspace. It never opens source files or saved Local History snapshots. This
 extension-free approach cannot see unsaved edits, terminal commands, cursor
 movement, selections, or diagnostics.
 
@@ -109,15 +116,11 @@ shared subjects are matched locally; an LLM is not required for this fast path.
 
 ## EverOS integration
 
-KnowU uses the current unified EverOS Memory API v2 by default:
+KnowU uses the EverOS Personal Memory API v1:
 
-- `POST /api/v2/memory/add` for approved memories
-- `POST /api/v2/memory/flush` to trigger extraction
-- `POST /api/v2/memory/search` with hybrid retrieval for each query
-
-Legacy EverOS Cloud accounts can set `EVEROS_API_VERSION=v1`. KnowU then uses
-the documented v1 personal-memory add, flush, and search contracts while
-preserving the same local privacy boundary and safe fallback behavior.
+- `POST /api/v1/memories` for approved memories
+- `POST /api/v1/memories/flush` to trigger extraction
+- `POST /api/v1/memories/search` with hybrid retrieval for each query
 
 The `MemoryService` interface isolates the application from vendor-specific
 logic. `EverOSMemoryService` implements persistent storage and retrieval. If
@@ -134,6 +137,22 @@ Two explicit ingestion paths are available:
 Adding or editing a user correction always saves locally first and then attempts
 to sync that approved correction to EverOS.
 
+## AWS Bedrock integration
+
+Amazon Bedrock is available as a first-class AI provider without adding the AWS
+SDK. KnowU calls the native Bedrock Runtime `CountTokens` and `Converse`
+endpoints with a user-owned Bedrock API key stored in macOS Keychain. The
+default model is `us.anthropic.claude-sonnet-4-6`; region and model remain
+configurable.
+
+Before inference, Bedrock returns the model-specific prompt-token count. When
+the system context is eligible, KnowU places an explicit prompt cache point and
+records cache-read/cache-write tokens. This can make repeated follow-ups cheaper
+when the selected context remains byte-identical, without another summarization
+model call. See the
+[Bedrock CountTokens API](https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_CountTokens.html)
+and [prompt caching documentation](https://docs.aws.amazon.com/bedrock/latest/userguide/prompt-caching.html).
+
 ## Snowflake integration
 
 KnowU sends one aggregate telemetry row per query through the Snowflake SQL API.
@@ -148,6 +167,8 @@ Each `INFERENCE_RUNS` row contains:
 - actual provider input/output usage when returned
 - latency and optional configured cost estimate
 - memory count and memory provider
+- context token budget, estimated packed tokens, and units considered/sent/omitted
+- selected detail level and Bedrock preflight/cache token counts
 - measurement method and timestamp
 
 Run [`snowflake/setup.sql`](snowflake/setup.sql) before starting the app with
@@ -169,10 +190,14 @@ EverOS or Snowflake.
 External boundaries:
 
 - **EverOS:** approved/derived memories only—profile facts, interests,
-  projects, patterns, explicit corrections, and demo seed facts.
-- **AI provider:** the active conversation plus query-specific approved
-  memories and compact locally derived activity facts. Raw activity rows are
-  never attached.
+  projects, patterns, explicit corrections, and demo seed facts. Memory search
+  receives the current question and, after **Ask with context**, the selected
+  thread subject; selected event metadata is never sent to EverOS.
+- **AI provider:** the bounded conversation plus query-specific memories,
+  aggregates, and—only after **Ask with context**—sanitized selected-thread
+  titles, search phrases, domain/path resources, timestamps, and reliable live
+  durations. Full URLs, URL queries/fragments, browser-profile IDs, event IDs,
+  source-file contents, and detected credential-like fields are not attached.
 - **Snowflake:** numeric/aggregate inference telemetry only by default.
 
 Optional Snowflake `AI_COUNT_TOKENS` support is off by default because it would
@@ -188,14 +213,20 @@ deterministic character-based ratio. The UI labels this
 `provider usage scaled estimate`.
 
 If the provider omits usage, both prompts use the same transparent local
-character estimate. If `SNOWFLAKE_ENABLE_AI_COUNT_TOKENS=true`, both approved
+conservative estimate. `KNOWU_REQUEST_TOKEN_BUDGET` is therefore an estimated
+ceiling for OpenAI and Anthropic; Amazon Bedrock also rejects a request when its
+exact `CountTokens` preflight exceeds the input allowance. If
+`SNOWFLAKE_ENABLE_AI_COUNT_TOKENS=true`, both approved
 derived prompts are counted with Snowflake `AI_COUNT_TOKENS`; the measurement
 method and tokenizer model are recorded with the run. No metric is presented as
 actual when it is estimated.
 
 Output tokens come from provider usage when available, with the same local
-estimate as a fallback. Cost is calculated only when the two optional current
-per-million-token rates are supplied.
+estimate as a fallback. Cost is calculated only when current input/output
+per-million-token rates are supplied. Optional cache-read/cache-write rates make
+Bedrock estimates cache-aware. Missing cache-read rates fall back conservatively
+to the ordinary input rate; a cache write without an explicit write rate leaves
+cost unset rather than understating it.
 
 ## Local development
 
@@ -280,7 +311,7 @@ Secrets are ignored by git and must never be committed.
 ## KnowU capabilities
 
 - KnowU product identity and “Remembers more. Sends less.” experience
-- vendor-isolated memory service and EverOS v2 persistent integration
+- vendor-isolated memory service and EverOS v1 persistent integration
 - explicit safe-memory ingestion and deterministic EverOS demo seed
 - query-specific selective-context engine and baseline comparison
 - provider-usage-aware token economics with visible measurement provenance

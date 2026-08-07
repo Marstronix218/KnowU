@@ -14,13 +14,13 @@ token-economics telemetry. Raw personal activity remains local.
 | --- | --- | --- |
 | React/Vite interface | `apps/desktop/src` | Onboarding, dashboard, history, profile, assistant, and settings |
 | Tauri/Rust core | `apps/desktop/src-tauri/src` | IPC commands, collection, continuous Chrome backfill, editor-history metadata import, retention, context assembly, SQLite, Keychain, scheduling, and provider calls |
-| Memory service | `apps/desktop/src-tauri/src/memory` | Approved-memory ingestion, EverOS v2 add/flush/search, and safe local fallback |
-| Context builders | `apps/desktop/src-tauri/src/context.rs` | Full-context baseline and query-specific KnowU context |
+| Memory service | `apps/desktop/src-tauri/src/memory` | Approved-memory ingestion, EverOS v1 add/flush/search, and safe local fallback |
+| Context builders | `apps/desktop/src-tauri/src/context.rs` | Deterministic token-budgeted packing of memories, aggregates, and sanitized selected-thread evidence |
 | Analytics service | `apps/desktop/src-tauri/src/analytics` | Token measurement provenance and Snowflake SQL API telemetry |
 | SQLite store | Tauri application-data directory | Activity, settings, profiles, corrections, recommendations, inference telemetry, and extension pairing state |
 | Chrome extension | `apps/extension` | Active-tab URL/title timing, exclusions, pause, and local transport |
 | Native Messaging helper | `apps/desktop/src-tauri/src/bin/knowu-native-host.rs` | Chrome stdio framing and forwarding to the running Rust core |
-| OpenAI or Anthropic | external | Profile generation, recommendations, and assistant responses |
+| OpenAI, Anthropic, or Amazon Bedrock | external | Profile generation, recommendations, and assistant responses; Bedrock adds exact token preflight and prompt-cache usage |
 | EverMind EverOS | external | Persistent approved memory and query-specific retrieval |
 | Snowflake | external | Aggregate inference-run telemetry and context-economics analysis |
 
@@ -44,26 +44,33 @@ Chrome tabs --> extension --> local bridge --> SQLite
                                             v
                                   approved profile facts ----> EverOS
                                             |
-current question --------------------> relevant memory search
+current question + selected subject -> relevant memory search
        |                                    |
        +--> local query-specific facts -----+
+       +--> sanitized selected evidence ----+
                                             |
-                 query-complete answer context
+          deterministic token-budgeted context packer
                                             |
                                             v
-                                  OpenAI or Anthropic
+                           OpenAI / Anthropic / Bedrock
                                             |
                                             +----> answer + provider usage
                                             |
                                             v
                               local inference telemetry ----> Snowflake
 
-larger full-context baseline --> local comparison only
+larger full-context baseline --> local comparison; optional Snowflake token count
 ```
 
-The production answer path always uses EverOS memories plus compact local facts.
-The larger baseline is not an alternate answer mode; it exists to demonstrate
-the token savings of selective context without omitting answer-critical facts.
+The answer path always uses relevant memories plus compact local facts. An
+explicitly selected thread also contributes sanitized titles, searches,
+domain/path resources, timestamps, and reliable live durations. Units are
+ranked deterministically under a configurable token budget; authoritative and
+aggregate evidence is kept before representative event detail. The larger
+baseline is not an alternate answer mode and is never sent to the AI provider;
+it demonstrates the savings without omitting answer-critical facts. When the
+explicit `SNOWFLAKE_ENABLE_AI_COUNT_TOKENS` option is enabled, Snowflake receives
+both derived comparison prompts solely to count tokens.
 
 The frontend calls typed Tauri commands through `invoke`. It does not open the
 database, read Keychain, or call providers directly. Outside Tauri, the same
@@ -95,7 +102,10 @@ KnowU checks the Local History indexes for Visual Studio Code, Cursor, and
 Cortex Code. It records the editor, workspace-relative file path, and save
 timestamp for recent files inside known workspaces. It never opens the saved
 snapshot or current source file. Hidden files, common generated/dependency
-trees, and credential/key filenames are excluded.
+trees, and credential/key filenames are excluded. If Local History and window
+titles do not identify a file, dashboard and activity responses may also derive
+recent changed paths from Git working-tree metadata in the editor's most
+recently active local workspace; source contents are still never opened.
 
 Work threads are grouped by subject rather than application category. The Rust
 core extracts repeated local anchors from search queries, page/window titles,
@@ -170,8 +180,9 @@ first refresh deletes bootstrap activity older than 30 days.
 ## Current implementation boundaries
 
 - Chrome is implemented; Safari and Firefox are not.
-- Extension-free editor context currently reflects Local History saves, not
-  unsaved edits, terminal commands, cursor position, selections, or diagnostics.
+- Extension-free editor context reflects Local History saves and recent Git
+  working-tree paths, not unsaved edits, terminal commands, cursor position,
+  selections, or diagnostics.
 - Native helper registration is not a polished installer flow.
 - Extension exclusions are stored separately; the desktop collection state is
   synchronized on extension status checks.

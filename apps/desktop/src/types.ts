@@ -1,6 +1,6 @@
 export type RangeKey = "today" | "7d" | "30d";
 
-export type Provider = "openai" | "anthropic";
+export type Provider = "openai" | "anthropic" | "bedrock";
 
 export interface UsageSlice {
   name: string;
@@ -20,6 +20,7 @@ export interface ActivityEvent {
   browserProfile?: string;
   startedAt: string;
   durationSeconds: number;
+  modifiedFiles?: string[];
   topic?: string;
   source: "collector" | "chrome" | "history" | "editor" | "firefox" | "safari";
 }
@@ -136,6 +137,26 @@ export interface ChatMessage {
   createdAt: string;
 }
 
+export interface ThreadContextEvent {
+  observedAt: string;
+  appName: string;
+  source: ActivityEvent["source"];
+  title?: string;
+  resource?: string;
+  searchQuery?: string;
+  observedActiveSeconds?: number;
+}
+
+export interface ThreadContext {
+  version: 1;
+  subject: string;
+  signalCount: number;
+  apps: string[];
+  observedFrom?: string;
+  observedThrough?: string;
+  events: ThreadContextEvent[];
+}
+
 export type ChatMode = "optimized";
 
 export interface MemoryRecord {
@@ -161,6 +182,15 @@ export interface ContextEconomics {
   latencyMs: number;
   estimatedCostUsd?: number;
   memoryCount: number;
+  contextBudgetTokens: number;
+  contextEstimatedTokens: number;
+  contextUnitsConsidered: number;
+  contextUnitsSent: number;
+  contextUnitsOmitted: number;
+  contextDetailLevel: string;
+  providerPreflightInputTokens?: number;
+  cacheReadInputTokens?: number;
+  cacheWriteInputTokens?: number;
   measurementMethod: string;
   telemetryStatus: string;
   baselineContextPreview: string;
