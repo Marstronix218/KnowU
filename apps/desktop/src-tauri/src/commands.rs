@@ -476,7 +476,7 @@ fn native_application_icon(app_name: &str) -> Option<String> {
     }
 
     let digest = format!("{:x}", Sha256::digest(app_path.as_bytes()));
-    let cache_dir = std::env::temp_dir().join("knov-app-icons");
+    let cache_dir = std::env::temp_dir().join("knowu-app-icons");
     fs::create_dir_all(&cache_dir).ok()?;
     let png = cache_dir.join(format!("{digest}.png"));
     if !png.is_file() && !convert_icon_to_png(&source, &png) {
@@ -1052,7 +1052,7 @@ pub async fn chat(
 #[tauri::command]
 pub fn get_pairing_info(state: State<'_, AppState>) -> AppResult<Value> {
     Ok(json!({
-        "nativeHost":"com.knov.companion",
+        "nativeHost":"com.knowu.companion",
         "pairingToken":ensure_pairing_token(&state.db)?,
         "localhostEndpoint":"http://127.0.0.1:48321",
         "protocolVersion":1
@@ -1075,8 +1075,8 @@ pub fn install_native_host(extension_id: String) -> AppResult<String> {
         .parent()
         .ok_or_else(|| AppError::InvalidInput("Application bundle path is unavailable.".into()))?;
     let candidates = [
-        directory.join("knov-native-host"),
-        directory.join("../Resources/knov-native-host"),
+        directory.join("knowu-native-host"),
+        directory.join("../Resources/knowu-native-host"),
     ];
     let host = candidates
         .into_iter()
@@ -1091,9 +1091,9 @@ pub fn install_native_host(extension_id: String) -> AppResult<String> {
         .ok_or_else(|| AppError::InvalidInput("Home directory is unavailable.".into()))?
         .join("Library/Application Support/Google/Chrome/NativeMessagingHosts");
     std::fs::create_dir_all(&manifest_dir)?;
-    let manifest_path = manifest_dir.join("com.knov.companion.json");
+    let manifest_path = manifest_dir.join("com.knowu.companion.json");
     let manifest = json!({
-        "name":"com.knov.companion",
+        "name":"com.knowu.companion",
         "description":"KnowU local activity bridge",
         "path":host.canonicalize()?.to_string_lossy(),
         "type":"stdio",
@@ -1112,7 +1112,7 @@ pub fn delete_all_data(state: State<'_, AppState>) -> AppResult<()> {
     ensure_pairing_token(&state.db)?;
     if let Some(home) = dirs::home_dir() {
         let manifest = home.join(
-            "Library/Application Support/Google/Chrome/NativeMessagingHosts/com.knov.companion.json",
+            "Library/Application Support/Google/Chrome/NativeMessagingHosts/com.knowu.companion.json",
         );
         if manifest.exists() {
             std::fs::remove_file(manifest)?;

@@ -22,15 +22,15 @@ If you installed KnowU from a bundle but do not have the repository locally,
 download it before building the unpacked extension:
 
 ```sh
-git clone https://github.com/Marstronix218/knov.git
-cd knov
+git clone https://github.com/Marstronix218/knowu.git
+cd knowu
 ```
 
-From the `knov` repository root:
+From the `knowu` repository root:
 
 ```sh
 npm install
-npm run build --workspace @knov/chrome-extension
+npm run build --workspace @knowu/chrome-extension
 ```
 
 When using `npm run dev:desktop`, build the Native Messaging helper as well:
@@ -38,7 +38,7 @@ When using `npm run dev:desktop`, build the Native Messaging helper as well:
 ```sh
 cargo build \
   --manifest-path apps/desktop/src-tauri/Cargo.toml \
-  --bin knov-native-host
+  --bin knowu-native-host
 ```
 
 Then:
@@ -120,7 +120,7 @@ For manual host registration and the local HTTP development fallback, see
 ## Native Messaging contract
 
 Production communication uses Chrome Native Messaging host
-`com.knov.companion`. Its host manifest must list the unpacked extension's
+`com.knowu.companion`. Its host manifest must list the unpacked extension's
 origin under `allowed_origins`. Chrome provides the four-byte length framing; the
 JSON request body is:
 
@@ -189,8 +189,8 @@ approximately every 30 seconds.
 
 Settings can explicitly select local HTTP for development. Only
 `http://127.0.0.1`, `http://localhost`, or `http://[::1]` are accepted. Requests
-use `Authorization: Bearer <pairing-token>`, the retained `X-Knov-Protocol: 1`
-compatibility header, and the
+use `Authorization: Bearer <pairing-token>`, the canonical
+`X-KnowU-Protocol: 1` header, and the
 same status/events shapes at `GET /v1/extension/status` and
 `POST /v1/extension/events`. HTTP is not the production default.
 

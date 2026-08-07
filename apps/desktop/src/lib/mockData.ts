@@ -131,7 +131,7 @@ export const mockProfile: ProfileData = {
       title: "Active projects",
       items: [
         {
-          id: "project-knov",
+          id: "project-knowu",
           label: "KnowU",
           description: "Apple Silicon macOS alpha using Tauri, React, Rust, SQLite, and a Chrome extension.",
           confidence: 0.99,

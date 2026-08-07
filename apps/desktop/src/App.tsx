@@ -57,7 +57,7 @@ const navigation = [
 
 function App() {
   const [setupComplete, setSetupComplete] = useState(
-    () => localStorage.getItem("knov.setup-complete") === "true",
+    () => localStorage.getItem("knowu.setup-complete") === "true",
   );
   const route = useHashRoute();
 
@@ -65,7 +65,7 @@ function App() {
     return (
       <SetupWizard
         onComplete={() => {
-          localStorage.setItem("knov.setup-complete", "true");
+          localStorage.setItem("knowu.setup-complete", "true");
           setSetupComplete(true);
         }}
       />
@@ -284,7 +284,7 @@ function Sidebar({ route }: { route: string }) {
 }
 
 function LogoMark() {
-  return <img className="brand-mark" src="/knov-icon.svg" alt="" aria-hidden="true" />;
+  return <img className="brand-mark" src="/knowu-icon.svg" alt="" aria-hidden="true" />;
 }
 
 function PageHeader({
@@ -433,7 +433,7 @@ function makeContextBrief(thread: WorkThread): string {
 
 function DashboardContent({ data }: { data: DashboardData }) {
   const threads = useMemo(() => deriveThreads(data), [data]);
-  const storedThread = localStorage.getItem("knov.selected-thread");
+  const storedThread = localStorage.getItem("knowu.selected-thread");
   const [selectedId, setSelectedId] = useState(storedThread ?? threads[0]?.id);
   const [actionMessage, setActionMessage] = useState("");
   const selected = threads.find((thread) => thread.id === selectedId) ?? threads[0];
@@ -445,7 +445,7 @@ function DashboardContent({ data }: { data: DashboardData }) {
 
   const selectThread = (id: string) => {
     setSelectedId(id);
-    localStorage.setItem("knov.selected-thread", id);
+    localStorage.setItem("knowu.selected-thread", id);
     setActionMessage("");
   };
   const resume = () => {
@@ -461,7 +461,7 @@ function DashboardContent({ data }: { data: DashboardData }) {
     await navigator.clipboard.writeText(makeContextBrief(selected));
     setActionMessage("Context brief copied.");
   };
-  const prepareAssistant = () => sessionStorage.setItem("knov.active-context-brief", makeContextBrief(selected));
+  const prepareAssistant = () => sessionStorage.setItem("knowu.active-context-brief", makeContextBrief(selected));
 
   return (
     <>
@@ -616,7 +616,7 @@ function ThreadsPage() {
                     <p>{selected.summary}</p>
                     <div className="next-move"><Sparkles size={17} /><span><small>Suggested next move</small><strong>{selected.nextMove}</strong></span></div>
                     <EvidenceRail events={selected.events} />
-                    <a className="primary-button large" href="#/dashboard" onClick={() => localStorage.setItem("knov.selected-thread", selected.id)}>Continue in Now <ArrowUpRight size={17} /></a>
+                    <a className="primary-button large" href="#/dashboard" onClick={() => localStorage.setItem("knowu.selected-thread", selected.id)}>Continue in Now <ArrowUpRight size={17} /></a>
                   </>
                 ) : <EmptyState title="Choose a thread" detail="Select a thread to inspect the local evidence and suggested next move." />}
               </aside>
@@ -841,7 +841,7 @@ function ProfilePage() {
 }
 
 function AssistantPage() {
-  const activeContextBrief = sessionStorage.getItem("knov.active-context-brief");
+  const activeContextBrief = sessionStorage.getItem("knowu.active-context-brief");
   const integration = useResource(() => api.integrationStatus(), []);
   const [messages, setMessages] = useState<ChatMessage[]>([
     {
@@ -1167,7 +1167,7 @@ function SettingsPage() {
         <Modal title="Delete everything?" onClose={() => setConfirmDelete(false)}>
           <p className="modal-copy">This cannot be undone from within KnowU. Local app data and the Keychain credential will be removed. EverOS memories must be deleted from EverOS separately.</p>
           <div className="modal-actions"><button className="ghost-button" onClick={() => setConfirmDelete(false)}>Cancel</button><button className="danger-button" onClick={() => api.deleteAllData().then(() => {
-            localStorage.removeItem("knov.setup-complete");
+            localStorage.removeItem("knowu.setup-complete");
             window.location.hash = "";
             window.location.reload();
           })}>Delete permanently</button></div>

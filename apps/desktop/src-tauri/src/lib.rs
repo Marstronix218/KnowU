@@ -31,7 +31,7 @@ pub fn run() {
         )
         .setup(|app| {
             let data_dir = app.path().app_data_dir()?;
-            let db = Arc::new(Database::open(data_dir.join("knov.sqlite3"))?);
+            let db = Arc::new(Database::open(data_dir.join("knowu.sqlite3"))?);
             let launch_result = if db.settings()?.launch_at_login {
                 app.autolaunch().enable()
             } else {

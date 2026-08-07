@@ -11,7 +11,7 @@ use crate::{
     models::{ChatMessage, ProfileDocument, Recommendation, RefreshResult, UserCorrection},
 };
 
-const KEYCHAIN_SERVICE: &str = "com.knov.desktop.llm";
+const KEYCHAIN_SERVICE: &str = "com.knowu.desktop.llm";
 
 #[derive(Debug, Clone)]
 pub struct CompletionResult {
@@ -420,7 +420,7 @@ fn decode_profile(value: Value) -> AppResult<ProfileDocument> {
 fn profile_response_format() -> Value {
     json!({
         "type":"json_schema",
-        "name":"knov_profile_refresh",
+        "name":"knowu_profile_refresh",
         "strict":true,
         "schema":{
             "type":"object",

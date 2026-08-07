@@ -1,8 +1,8 @@
 # Alpha setup
 
 > This setup guide covers KnowU's retained local collector and Chrome companion.
-> Internal `knov` identifiers in paths, npm scopes, and Native Messaging names
-> are compatibility contracts and are intentionally unchanged.
+> Internal `knowu` identifiers in paths, npm scopes, and Native Messaging names
+> are the canonical project identifiers.
 
 ## Supported environment
 
@@ -85,7 +85,7 @@ files.
 From the repository root:
 
 ```sh
-npm run build --workspace @knov/chrome-extension
+npm run build --workspace @knowu/chrome-extension
 ```
 
 In Chrome:
@@ -104,7 +104,7 @@ installation, in which case the Native Messaging manifest must be regenerated.
 ```sh
 cargo build \
   --manifest-path apps/desktop/src-tauri/Cargo.toml \
-  --bin knov-native-host
+  --bin knowu-native-host
 ```
 
 ### 3. Register the helper with Chrome
@@ -117,40 +117,40 @@ Run the following from the repository root after replacing the extension ID.
 The Node command writes only Chrome's per-user Native Messaging manifest.
 
 ```sh
-KNOV_REPO="$(pwd)"
-KNOV_EXTENSION_ID="replace-with-the-32-character-id"
-KNOV_HOST="$KNOV_REPO/apps/desktop/src-tauri/target/debug/knov-native-host"
-KNOV_MANIFEST_DIR="$HOME/Library/Application Support/Google/Chrome/NativeMessagingHosts"
+KNOWU_REPO="$(pwd)"
+KNOWU_EXTENSION_ID="replace-with-the-32-character-id"
+KNOWU_HOST="$KNOWU_REPO/apps/desktop/src-tauri/target/debug/knowu-native-host"
+KNOWU_MANIFEST_DIR="$HOME/Library/Application Support/Google/Chrome/NativeMessagingHosts"
 
-mkdir -p "$KNOV_MANIFEST_DIR"
+mkdir -p "$KNOWU_MANIFEST_DIR"
 node -e '
 const fs = require("fs");
 const [path, host, extensionId] = process.argv.slice(1);
 fs.writeFileSync(path, JSON.stringify({
-  name: "com.knov.companion",
+  name: "com.knowu.companion",
   description: "KnowU local activity bridge",
   path: host,
   type: "stdio",
   allowed_origins: [`chrome-extension://${extensionId}/`]
 }, null, 2) + "\n");
 ' \
-  "$KNOV_MANIFEST_DIR/com.knov.companion.json" \
-  "$KNOV_HOST" \
-  "$KNOV_EXTENSION_ID"
+  "$KNOWU_MANIFEST_DIR/com.knowu.companion.json" \
+  "$KNOWU_HOST" \
+  "$KNOWU_EXTENSION_ID"
 ```
 
 Verify the registration:
 
 ```sh
-test -x "$KNOV_HOST"
+test -x "$KNOWU_HOST"
 node -e '
 const fs = require("fs");
 const path = process.argv[1];
 const manifest = JSON.parse(fs.readFileSync(path, "utf8"));
-if (manifest.name !== "com.knov.companion") process.exit(1);
+if (manifest.name !== "com.knowu.companion") process.exit(1);
 console.log(manifest.path);
 console.log(manifest.allowed_origins[0]);
-' "$KNOV_MANIFEST_DIR/com.knov.companion.json"
+' "$KNOWU_MANIFEST_DIR/com.knowu.companion.json"
 ```
 
 Restart Chrome after creating or changing the manifest.
@@ -161,8 +161,8 @@ Keep the Tauri app running so it creates the database and its protected
 per-user Native Messaging socket.
 
 ```sh
-KNOV_DB="$HOME/Library/Application Support/com.knov.desktop/knov.sqlite3"
-sqlite3 "$KNOV_DB" \
+KNOWU_DB="$HOME/Library/Application Support/com.knowu.desktop/knowu.sqlite3"
+sqlite3 "$KNOWU_DB" \
   'SELECT pairing_token FROM extension_state WHERE singleton=1;'
 ```
 
@@ -170,7 +170,7 @@ If that path is absent, locate the database without modifying it:
 
 ```sh
 find "$HOME/Library/Application Support" \
-  -name knov.sqlite3 -print
+  -name knowu.sqlite3 -print
 ```
 
 Open the extension's **Details → Extension options**, leave transport set to
@@ -214,7 +214,7 @@ clear Chrome extension storage.
 To remove the manual host registration after stopping Chrome:
 
 ```sh
-rm "$HOME/Library/Application Support/Google/Chrome/NativeMessagingHosts/com.knov.companion.json"
+rm "$HOME/Library/Application Support/Google/Chrome/NativeMessagingHosts/com.knowu.companion.json"
 ```
 
 This removes only that exact manifest. Remove the unpacked extension from

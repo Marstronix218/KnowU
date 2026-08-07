@@ -110,7 +110,7 @@ fn import_chrome_history(
     if !source.exists() {
         return Ok(0);
     }
-    let temporary = std::env::temp_dir().join(format!("knov-history-{}.sqlite", Uuid::new_v4()));
+    let temporary = std::env::temp_dir().join(format!("knowu-history-{}.sqlite", Uuid::new_v4()));
     fs::copy(source, &temporary)?;
     #[cfg(unix)]
     {
@@ -394,7 +394,7 @@ fn start_native_socket(db: Arc<Database>) -> AppResult<()> {
 
     let directory = dirs::data_dir()
         .ok_or_else(|| AppError::InvalidInput("Application data directory unavailable".into()))?
-        .join("com.knov.desktop");
+        .join("com.knowu.desktop");
     fs::create_dir_all(&directory)?;
     let socket_path = directory.join("native-messaging.sock");
     if socket_path.exists() {

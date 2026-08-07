@@ -3,7 +3,7 @@ import { cleanup } from "@testing-library/react";
 import { afterEach, beforeEach } from "vitest";
 
 beforeEach(() => {
-  localStorage.setItem("knov.setup-complete", "true");
+  localStorage.setItem("knowu.setup-complete", "true");
 });
 
 afterEach(() => {

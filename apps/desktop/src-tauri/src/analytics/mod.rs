@@ -191,12 +191,7 @@ impl SnowflakeAnalyticsService {
         for (index, value) in values.into_iter().enumerate() {
             bindings.insert((index + 1).to_string(), value);
         }
-        let mut body = json!({
-            "statement":statement,
-            "timeout":30,
-            "bindings":bindings,
-            "parameters":{"AUTOCOMMIT":true}
-        });
+        let mut body = statement_request(statement, bindings);
         for (key, value) in [
             ("warehouse", self.warehouse.as_deref()),
             ("database", self.database.as_deref()),
@@ -289,6 +284,14 @@ fn binding(binding_type: &str, value: &str) -> Value {
     json!({"type":binding_type,"value":value})
 }
 
+fn statement_request(statement: &str, bindings: Map<String, Value>) -> Value {
+    json!({
+        "statement":statement,
+        "timeout":30,
+        "bindings":bindings
+    })
+}
+
 fn parse_i64(value: Option<&Value>) -> Option<i64> {
     value.and_then(|value| {
         value
@@ -327,5 +330,14 @@ mod tests {
             measurement.measurement_method,
             "provider_usage_scaled_estimate"
         );
+    }
+
+    #[test]
+    fn sql_api_request_omits_unsupported_autocommit_parameter() {
+        let request = statement_request("SELECT 1", Map::new());
+
+        assert_eq!(request["statement"], "SELECT 1");
+        assert_eq!(request["timeout"], 30);
+        assert!(request.get("parameters").is_none());
     }
 }

@@ -47,7 +47,7 @@ function chatRun(message: ChatMessage): ChatRunResult {
 
 function stubApi() {
   sessionStorage.clear();
-  localStorage.removeItem("knov.selected-thread");
+  localStorage.removeItem("knowu.selected-thread");
   vi.spyOn(api, "settings").mockResolvedValue(clone(mockSettings));
   vi.spyOn(api, "dashboard").mockResolvedValue(clone(mockDashboard));
   vi.spyOn(api, "activity").mockResolvedValue(clone(mockDashboard.recentActivity));
@@ -124,7 +124,7 @@ describe("onboarding", () => {
     fireEvent.click(screen.getByRole("button", { name: /Build my first profile/ }));
 
     expect(await screen.findByRole("heading", { name: "Pick up where you left off." })).toBeInTheDocument();
-    expect(localStorage.getItem("knov.setup-complete")).toBe("true");
+    expect(localStorage.getItem("knowu.setup-complete")).toBe("true");
   });
 });
 

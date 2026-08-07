@@ -8,10 +8,10 @@
     "apps/extension"
   ],
   "scripts": {
-    "dev": "npm run dev --workspace @knov/desktop",
-    "dev:desktop": "npm run tauri dev --workspace @knov/desktop",
+    "dev": "npm run dev --workspace @knowu/desktop",
+    "dev:desktop": "npm run tauri dev --workspace @knowu/desktop",
     "build": "npm run build --workspaces --if-present",
-    "build:desktop": "npm run bundle --workspace @knov/desktop",
+    "build:desktop": "npm run bundle --workspace @knowu/desktop",
     "typecheck": "npm run typecheck --workspaces --if-present",
     "test": "npm run test --workspaces --if-present",
     "check:rust": "cargo check --manifest-path apps/desktop/src-tauri/Cargo.toml",

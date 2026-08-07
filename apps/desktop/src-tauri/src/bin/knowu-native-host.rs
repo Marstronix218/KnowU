@@ -65,7 +65,7 @@ fn main() {
 fn native_socket_path() -> Option<std::path::PathBuf> {
     dirs::data_dir().map(|directory| {
         directory
-            .join("com.knov.desktop")
+            .join("com.knowu.desktop")
             .join("native-messaging.sock")
     })
 }

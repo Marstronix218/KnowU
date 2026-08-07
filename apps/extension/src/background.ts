@@ -21,7 +21,7 @@ import {
 import { sendEvents, testConnection } from "./background/transport";
 import type { BrowserActivityEvent } from "./shared/types";
 
-const HEARTBEAT_ALARM = "knov-heartbeat";
+const HEARTBEAT_ALARM = "knowu-heartbeat";
 const HEARTBEAT_MINUTES = 0.5;
 const MAX_EPHEMERAL_EVENTS = 100;
 let transitionChain = Promise.resolve();

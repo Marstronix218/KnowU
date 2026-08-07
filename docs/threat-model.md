@@ -1,7 +1,7 @@
 # KnowU threat model
 
-> Internal `knov` protocol and storage identifiers are retained compatibility
-> contracts. Product-facing behavior and external boundaries are KnowU.
+> Internal `knowu` protocol and storage identifiers are canonical KnowU
+> contracts. Product-facing behavior and external boundaries are also KnowU.
 
 ## Security objective
 

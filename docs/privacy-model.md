@@ -72,9 +72,9 @@ acceptable.
 
 ## Credentials
 
-- OpenAI/Anthropic keys can be stored in macOS Keychain service
-  `com.knov.desktop.llm` (a retained compatibility identifier) or supplied by
-  environment during source development.
+- OpenAI/Anthropic keys can be stored in the macOS Keychain service
+  `com.knowu.desktop.llm` or supplied by the environment during source
+  development.
 - EverOS and Snowflake credentials are read from the native process environment
   and are never returned to the frontend.
 - KnowU does not auto-load `.env`; `.env` files are gitignored.

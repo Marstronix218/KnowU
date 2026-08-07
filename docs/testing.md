@@ -32,17 +32,17 @@ These commands cover:
 Desktop frontend:
 
 ```sh
-npm run typecheck --workspace @knov/desktop
-npm test --workspace @knov/desktop
-npm run build --workspace @knov/desktop
+npm run typecheck --workspace @knowu/desktop
+npm test --workspace @knowu/desktop
+npm run build --workspace @knowu/desktop
 ```
 
 Chrome extension:
 
 ```sh
-npm run typecheck --workspace @knov/chrome-extension
-npm test --workspace @knov/chrome-extension
-npm run build --workspace @knov/chrome-extension
+npm run typecheck --workspace @knowu/chrome-extension
+npm test --workspace @knowu/chrome-extension
+npm run build --workspace @knowu/chrome-extension
 ```
 
 Rust core:
@@ -103,9 +103,9 @@ Chrome profile, or live provider accounts. Before an alpha handoff:
 With the app stopped, the macOS database is normally:
 
 ```sh
-KNOV_DB="$HOME/Library/Application Support/com.knov.desktop/knov.sqlite3"
-sqlite3 "$KNOV_DB" '.tables'
-sqlite3 "$KNOV_DB" \
+KNOWU_DB="$HOME/Library/Application Support/com.knowu.desktop/knowu.sqlite3"
+sqlite3 "$KNOWU_DB" '.tables'
+sqlite3 "$KNOWU_DB" \
   'SELECT source, COUNT(*) FROM activity_events GROUP BY source;'
 ```
 

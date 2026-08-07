@@ -75,18 +75,21 @@ Key implementation locations:
   comparison toggle, and memory sync controls.
 - `snowflake/setup.sql` — Snowflake table and aggregate view.
 
-The app keeps original internal identifiers such as `com.knov.desktop`, the
-SQLite filename, native-host name, and npm workspace scopes to avoid breaking
-existing installations, migrations, and Chrome pairing. User-facing product
-branding is KnowU.
+The app uses KnowU consistently in its product branding and internal
+identifiers, including the bundle ID, SQLite filename, native-host name, and
+npm workspace scopes.
 
 ## EverOS integration
 
-KnowU uses the current unified EverOS Memory API v2:
+KnowU uses the current unified EverOS Memory API v2 by default:
 
 - `POST /api/v2/memory/add` for approved memories
 - `POST /api/v2/memory/flush` to trigger extraction
 - `POST /api/v2/memory/search` with hybrid retrieval for each query
+
+Legacy EverOS Cloud accounts can set `EVEROS_API_VERSION=v1`. KnowU then uses
+the documented v1 personal-memory add, flush, and search contracts while
+preserving the same local privacy boundary and safe fallback behavior.
 
 The `MemoryService` interface isolates the application from vendor-specific
 logic. `EverOSMemoryService` implements persistent storage and retrieval. If
@@ -122,6 +125,12 @@ Each `INFERENCE_RUNS` row contains:
 Run [`snowflake/setup.sql`](snowflake/setup.sql) before starting the app with
 Snowflake credentials. The included `CONTEXT_ECONOMICS_SUMMARY` view provides
 daily totals and average reduction.
+
+Snowflake requires users authenticating with programmatic access tokens to be
+covered by a network policy by default. If the SQL API returns error `390432`
+(`Network policy is required`), assign an allowlisted network policy to the PAT
+user or generate a temporary human-user PAT with Snowflake's network-policy
+requirement bypass enabled before retrying.
 
 ## Privacy model
 
@@ -256,5 +265,4 @@ Created specifically for this hackathon:
 - graceful missing-credential and integration-failure behavior
 
 Historical local collector and Chrome-pairing documentation remains in `docs/`;
-internal Knov identifiers are retained only where renaming would risk breaking
-existing data or native integration contracts.
+its paths, identifiers, and examples use the canonical KnowU naming.

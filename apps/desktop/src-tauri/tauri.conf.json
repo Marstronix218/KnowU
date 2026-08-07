@@ -3,7 +3,7 @@
   "productName": "KnowU",
   "mainBinaryName": "appsdesktop",
   "version": "0.1.0",
-  "identifier": "com.knov.desktop",
+  "identifier": "com.knowu.desktop",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",

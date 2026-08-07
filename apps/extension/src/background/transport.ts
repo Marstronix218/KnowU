@@ -50,7 +50,7 @@ async function authenticatedFetch(
       headers: {
         Authorization: `Bearer ${config.pairingToken}`,
         "Content-Type": "application/json",
-        "X-Knov-Protocol": String(PROTOCOL_VERSION),
+        "X-KnowU-Protocol": String(PROTOCOL_VERSION),
         ...(init?.headers ?? {})
       }
     });
