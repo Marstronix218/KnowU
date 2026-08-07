@@ -1,0 +1,7 @@
+{
+  "bundle": {
+    "externalBin": [
+      "binaries/knov-native-host"
+    ]
+  }
+}

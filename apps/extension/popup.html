@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>KnowU</title>
+    <script type="module" src="/src/popup.ts"></script>
+  </head>
+  <body>
+    <main class="popup-shell">
+      <header>
+        <img class="brand-mark" src="/knov-icon.svg" alt="" aria-hidden="true" />
+        <div>
+          <h1>KnowU</h1>
+          <p class="eyebrow">Chrome companion</p>
+        </div>
+      </header>
+
+      <section class="status-card" aria-live="polite">
+        <div class="status-line">
+          <span id="status-dot" class="status-dot"></span>
+          <div>
+            <strong id="collection-label">Loading…</strong>
+            <p id="connection-label">Checking local connection</p>
+          </div>
+        </div>
+        <button id="toggle-collection" class="primary" type="button" disabled>
+          Pause collection
+        </button>
+      </section>
+
+      <section class="current-card">
+        <p class="label">Current page</p>
+        <p id="current-title" class="current-title">No page is being collected</p>
+        <p id="current-host" class="muted"></p>
+      </section>
+
+      <p id="degraded-notice" class="notice" hidden>
+        Live browser timing is unavailable. KnowU can still use imported Chrome
+        history.
+      </p>
+
+      <footer>
+        <span id="queue-label">0 events waiting</span>
+        <button id="open-options" class="link-button" type="button">Settings</button>
+      </footer>
+    </main>
+  </body>
+</html>

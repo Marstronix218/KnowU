@@ -1,0 +1,30 @@
+{
+  "name": "knowu",
+  "version": "0.2.0",
+  "private": true,
+  "description": "A memory-efficient personal AI agent that remembers more and sends less",
+  "workspaces": [
+    "apps/desktop",
+    "apps/extension"
+  ],
+  "scripts": {
+    "dev": "npm run dev --workspace @knov/desktop",
+    "dev:desktop": "npm run tauri dev --workspace @knov/desktop",
+    "build": "npm run build --workspaces --if-present",
+    "build:desktop": "npm run bundle --workspace @knov/desktop",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "test": "npm run test --workspaces --if-present",
+    "check:rust": "cargo check --manifest-path apps/desktop/src-tauri/Cargo.toml",
+    "test:rust": "cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml"
+  },
+  "keywords": [
+    "tauri",
+    "personal-ai",
+    "local-first"
+  ],
+  "author": "Noriaki Kishida",
+  "license": "UNLICENSED",
+  "devDependencies": {
+    "oh-my-codex": "^0.20.3"
+  }
+}
