@@ -229,19 +229,34 @@ fn format_thread_summary(context: &ThreadContext) -> String {
         .filter_map(|app| safe_detail(app, 100).map(|app| quoted(&app)))
         .collect::<Vec<_>>()
         .join(", ");
+    let modified_files = context
+        .modified_files
+        .iter()
+        .take(16)
+        .filter_map(|path| safe_resource(path, "editor").map(|path| quoted(&path)))
+        .collect::<Vec<_>>()
+        .join(", ");
     format!(
-        "- [selected-thread] subject={}; locally observed signals={}; apps={}; observed from={} through={}; evidence metadata is provisional and browser-history durations are excluded",
+        "- [selected-thread] subject={}; locally observed signals={}; apps={}; recent modified files newest-first={}; observed from={} through={}; file paths are metadata-only and evidence metadata is provisional; browser-history durations are excluded",
         quoted(&safe_or_redacted(&context.subject, 160)),
         context.signal_count,
         if apps.is_empty() { "unknown" } else { &apps },
+        if modified_files.is_empty() { "unavailable" } else { &modified_files },
         quoted(&context.observed_from.as_deref().and_then(|value| safe_detail(value, 60)).unwrap_or_else(|| "unknown".into())),
         quoted(&context.observed_through.as_deref().and_then(|value| safe_detail(value, 60)).unwrap_or_else(|| "unknown".into())),
     )
 }
 
 fn format_activity_fact(facts: &QueryActivityFacts) -> String {
+    let modified_files = facts
+        .modified_files
+        .iter()
+        .take(16)
+        .filter_map(|path| safe_resource(path, "editor").map(|path| quoted(&path)))
+        .collect::<Vec<_>>()
+        .join(", ");
     format!(
-        "- [activity-aggregate] subject={}; match basis={}; matched events={}; first seen={}; last seen={}; calendar span seconds={}; observed active seconds={}; app-focus seconds={}; live-browser seconds={}; historical visits={}; browser-history reported seconds={} (unreliable foreground time); editor save signals={}; coverage=the requested bounded local-retention window",
+        "- [activity-aggregate] subject={}; match basis={}; matched events={}; first seen={}; last seen={}; calendar span seconds={}; observed active seconds={}; app-focus seconds={}; live-browser seconds={}; historical visits={}; browser-history reported seconds={} (unreliable foreground time); editor save signals={}; recent modified files newest-first={}; file paths are metadata-only Git working-tree evidence; coverage=the requested bounded local-retention window",
         quoted(&safe_or_redacted(&facts.subject, 120)),
         quoted(&safe_or_redacted(&facts.match_basis, 120)),
         facts.matched_events,
@@ -254,6 +269,7 @@ fn format_activity_fact(facts: &QueryActivityFacts) -> String {
         facts.historical_visits,
         facts.historical_reported_seconds,
         facts.editor_changes,
+        if modified_files.is_empty() { "unavailable" } else { &modified_files },
     )
 }
 
@@ -584,6 +600,10 @@ mod tests {
             historical_visits: 200,
             historical_reported_seconds: 50_000,
             editor_changes: 2,
+            modified_files: vec![
+                "apps/desktop/src/App.tsx".into(),
+                "apps/desktop/src-tauri/src/commands.rs".into(),
+            ],
             coverage_start_at: 0,
             coverage_end_at: 500,
         }
@@ -595,6 +615,7 @@ mod tests {
             subject: "Snowflake".into(),
             signal_count: event_count,
             apps: vec!["Google Chrome".into(), "Cursor".into()],
+            modified_files: vec!["src/snowflake_client.rs".into()],
             observed_from: Some("2026-08-07T13:08:00Z".into()),
             observed_through: Some("2026-08-07T14:01:00Z".into()),
             events: (0..event_count)
@@ -641,6 +662,8 @@ mod tests {
         assert!(package.text.contains("activity-aggregate"));
         assert!(package.text.contains("selected-event"));
         assert!(package.text.contains("Snowflake architecture detail"));
+        assert!(package.text.contains("apps/desktop/src/App.tsx"));
+        assert!(package.text.contains("src/snowflake_client.rs"));
         assert!(!package.text.contains("?secret=nope"));
         assert!(package.manifest.estimated_tokens <= 3_000);
         assert!(package.manifest.units_sent >= 10);

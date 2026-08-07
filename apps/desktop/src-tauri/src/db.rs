@@ -767,6 +767,7 @@ impl Database {
                 historical_visits,
                 historical_reported_seconds,
                 editor_changes,
+                modified_files: Vec::new(),
                 coverage_start_at: start_at,
                 coverage_end_at: end_at,
             });
@@ -1022,6 +1023,10 @@ fn is_activity_query_stopword(value: &str) -> bool {
             | "done"
             | "during"
             | "first"
+            | "file"
+            | "files"
+            | "filename"
+            | "filenames"
             | "from"
             | "have"
             | "hours"
@@ -1031,12 +1036,21 @@ fn is_activity_query_stopword(value: &str) -> bool {
             | "many"
             | "minutes"
             | "month"
+            | "most"
             | "much"
             | "overall"
             | "please"
             | "project"
             | "recent"
             | "recently"
+            | "change"
+            | "changed"
+            | "edit"
+            | "edited"
+            | "modify"
+            | "modified"
+            | "save"
+            | "saved"
             | "show"
             | "should"
             | "since"
@@ -1052,6 +1066,8 @@ fn is_activity_query_stopword(value: &str) -> bool {
             | "today"
             | "total"
             | "tracked"
+            | "touch"
+            | "touched"
             | "using"
             | "week"
             | "what"
@@ -1075,14 +1091,32 @@ fn activity_metric_intent(query: &str) -> bool {
         .split(|character: char| !character.is_alphanumeric())
         .filter(|word| !word.is_empty())
         .collect::<HashSet<_>>();
-    [
+    let time_intent = [
         "work", "worked", "working", "spend", "spent", "activity", "tracked",
     ]
     .iter()
     .any(|term| words.contains(term))
         && ["how long", "how much", "time", "hours", "minutes"]
             .iter()
-            .any(|term| query.contains(term))
+            .any(|term| query.contains(term));
+    time_intent || recent_file_activity_intent(&query)
+}
+
+pub(crate) fn recent_file_activity_intent(query: &str) -> bool {
+    let words = query
+        .split(|character: char| !character.is_alphanumeric())
+        .map(str::to_ascii_lowercase)
+        .filter(|word| !word.is_empty())
+        .collect::<HashSet<_>>();
+    ["file", "files", "filename", "filenames"]
+        .iter()
+        .any(|term| words.contains(*term))
+        && [
+            "work", "worked", "working", "change", "changed", "edit", "edited", "modify",
+            "modified", "save", "saved", "touch", "touched", "recent", "recently",
+        ]
+        .iter()
+        .any(|term| words.contains(*term))
 }
 
 fn display_query_subject(value: &str) -> String {
@@ -1526,6 +1560,28 @@ mod tests {
         assert_eq!(facts.len(), 1);
         assert_eq!(facts[0].subject, "All tracked activity");
         assert_eq!(facts[0].matched_events, 1);
+    }
+
+    #[test]
+    fn query_activity_facts_support_recent_file_questions() {
+        let db = Database::in_memory().unwrap();
+        let mut code = event(100, false);
+        code.app_name = "Code".into();
+        db.insert_event(&code, "code-activity").unwrap();
+
+        let facts = db
+            .query_activity_facts("Which files did I work on most recently?", 0, 1_000)
+            .unwrap();
+
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].subject, "All tracked activity");
+        assert_eq!(facts[0].matched_events, 1);
+        assert!(recent_file_activity_intent(
+            "Which files did I work on most recently?"
+        ));
+        assert!(!recent_file_activity_intent(
+            "Explain what a configuration file is."
+        ));
     }
 
     #[test]

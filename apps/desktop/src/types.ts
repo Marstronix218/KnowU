@@ -152,6 +152,7 @@ export interface ThreadContext {
   subject: string;
   signalCount: number;
   apps: string[];
+  modifiedFiles: string[];
   observedFrom?: string;
   observedThrough?: string;
   events: ThreadContextEvent[];

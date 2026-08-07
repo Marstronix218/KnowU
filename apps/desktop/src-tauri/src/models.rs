@@ -207,6 +207,8 @@ pub struct ThreadContext {
     pub subject: String,
     pub signal_count: usize,
     pub apps: Vec<String>,
+    #[serde(default)]
+    pub modified_files: Vec<String>,
     pub observed_from: Option<String>,
     pub observed_through: Option<String>,
     pub events: Vec<ThreadContextEvent>,
@@ -227,6 +229,8 @@ pub struct QueryActivityFacts {
     pub historical_visits: i64,
     pub historical_reported_seconds: i64,
     pub editor_changes: i64,
+    #[serde(default)]
+    pub modified_files: Vec<String>,
     pub coverage_start_at: i64,
     pub coverage_end_at: i64,
 }

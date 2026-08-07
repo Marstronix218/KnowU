@@ -722,7 +722,9 @@ describe("assistant chat", () => {
       version: 1,
       subject: "KnowU implementation",
       signalCount: expect.any(Number),
+      modifiedFiles: ["apps/desktop/src/App.tsx"],
     });
+    expect(screen.getByText(/Recent modified files \(newest first\): apps\/desktop\/src\/App\.tsx/)).toBeInTheDocument();
     expect(chat.mock.calls[0][2]?.events[0]).toMatchObject({
       appName: expect.any(String),
       source: expect.any(String),

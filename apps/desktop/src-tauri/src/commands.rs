@@ -1280,10 +1280,21 @@ pub async fn chat(
         )
     };
     let (activity_start, activity_end) = query_activity_range(&last.content, today_start, now);
-    let activity_facts =
+    let mut activity_facts =
         state
             .db
             .query_activity_facts(&activity_query, activity_start, activity_end)?;
+    if crate::db::recent_file_activity_intent(&last.content) {
+        let modified_files = chat_modified_files(
+            &state.db,
+            thread_context.as_ref(),
+            activity_start,
+            activity_end,
+        );
+        for facts in &mut activity_facts {
+            facts.modified_files.clone_from(&modified_files);
+        }
+    }
     let baseline_context = build_baseline_context(
         &profile,
         &corrections,
@@ -1736,6 +1747,56 @@ fn activity_query_text(
     parts.join(" ")
 }
 
+fn chat_modified_files(
+    db: &Database,
+    thread_context: Option<&ThreadContext>,
+    start_at: i64,
+    end_at: i64,
+) -> Vec<String> {
+    if let Some(files) = thread_context
+        .map(|context| context.modified_files.clone())
+        .filter(|files| !files.is_empty())
+    {
+        return files;
+    }
+
+    let mut apps = thread_context
+        .into_iter()
+        .flat_map(|context| context.apps.iter().cloned())
+        .collect::<Vec<_>>();
+    let recent_activity = db
+        .history(&HistoryRequest {
+            start_at,
+            end_at,
+            search: None,
+            source: None,
+            limit: Some(1_000),
+            offset: None,
+        })
+        .unwrap_or_default();
+    apps.extend(recent_activity.into_iter().map(|event| event.app_name));
+    apps.extend(
+        ["Code", "Cursor", "Cortex Code", "Xcode"]
+            .into_iter()
+            .map(str::to_string),
+    );
+
+    let mut seen = HashSet::new();
+    apps.into_iter()
+        .filter(|app| {
+            matches!(
+                app.trim().to_ascii_lowercase().as_str(),
+                "code" | "visual studio code" | "cursor" | "cortex code" | "xcode"
+            )
+        })
+        .filter(|app| seen.insert(app.trim().to_ascii_lowercase()))
+        .find_map(|app| {
+            let files = recent_editor_workspace_changes(&app, start_at, 16);
+            (!files.is_empty()).then_some(files)
+        })
+        .unwrap_or_default()
+}
+
 fn memory_query_text(question: &str, thread_context: Option<&ThreadContext>) -> String {
     let has_explicit_known_subject = contains_known_activity_subject(question);
     let mut parts = vec![question.trim().to_string()];
@@ -1942,6 +2003,7 @@ mod tests {
             subject: subject.into(),
             signal_count: 38,
             apps: vec!["Google Chrome".into()],
+            modified_files: vec![],
             observed_from: None,
             observed_through: None,
             events: vec![],

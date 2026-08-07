@@ -485,11 +485,18 @@ function makeThreadContext(thread: WorkThread): ThreadContext {
       ? undefined
       : Math.max(0, event.durationSeconds),
   }));
+  const modifiedFiles = [...new Map(
+    thread.events.flatMap((event) => {
+      const savedFile = event.source === "editor" ? editorFilePath(event) : undefined;
+      return [...(savedFile ? [savedFile] : []), ...(event.modifiedFiles ?? [])];
+    }).map((path) => [path.toLocaleLowerCase(), path]),
+  ).values()].slice(0, 16);
   return {
     version: 1,
     subject: thread.title,
     signalCount: thread.events.length,
     apps: [...new Set(thread.events.map((event) => event.appName))].slice(0, 12),
+    modifiedFiles,
     observedFrom: thread.events[thread.events.length - 1]?.startedAt,
     observedThrough: thread.lastActiveAt,
     events,
@@ -503,6 +510,9 @@ function makeContextBrief(context: ThreadContext): string {
     context.observedFrom && context.observedThrough
       ? `Observed from ${formatContextDateTime(context.observedFrom)} through ${formatContextDateTime(context.observedThrough)}.`
       : "No detailed timing evidence is available in this range.",
+    context.modifiedFiles?.length
+      ? `Recent modified files (newest first): ${context.modifiedFiles.join(", ")}.`
+      : "No modified-file metadata is available for this thread.",
     "Selected evidence candidates (the native core ranks these under the configured token budget):",
     ...context.events.map((event) => [
       `- ${formatContextDateTime(event.observedAt)} | ${event.source} | ${event.appName}`,
