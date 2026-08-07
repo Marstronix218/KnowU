@@ -112,7 +112,11 @@ movement, selections, or diagnostics.
 KnowU also groups repeated subjects across those sources. A Snowflake search,
 YouTube tutorial, dashboard, document, and editor path can therefore appear as
 one `Snowflake` work thread with each original event shown as evidence. Obvious
-shared subjects are matched locally; an LLM is not required for this fast path.
+shared subjects and cautious aliases are matched locally; for example, workouts,
+plank challenges, sit-ups, and strength training can form one `Workout` thread.
+Generic search or video navigation pages join only when the nearby activity in
+the same known browser profile has one unambiguous subject. An LLM is not
+required for this fast path.
 
 ## EverOS integration
 

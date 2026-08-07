@@ -112,7 +112,12 @@ core extracts repeated local anchors from search queries, page/window titles,
 domains, document names, and editor-relative paths. For example, Snowflake
 signals from YouTube, a search page, a document, `app.snowflake.com`, and an
 editor filename receive the same `Snowflake` topic while their original events
-remain separate evidence. This immediate grouping is deterministic and local.
+remain separate evidence. Common intent aliases can also resolve to a cautious
+canonical subject—for example, workouts, plank challenges, sit-ups, and
+strength training resolve to `Workout`. A low-information search or video
+navigation page inherits that subject only when nearby activity in the same
+known browser profile is unambiguous. This immediate grouping is deterministic
+and local.
 An optional future LLM refinement should operate only on bounded extracted
 terms, domains, counts, and source types—not raw activity rows—and must fall
 back to these local assignments if the provider is unavailable.

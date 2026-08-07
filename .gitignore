@@ -2,6 +2,7 @@ node_modules/
 dist/
 target/
 .DS_Store
+~$*.pptx
 .env
 .env.local
 .env.*.local
