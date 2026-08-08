@@ -184,6 +184,7 @@ small { font-size: inherit; }
 .search-field { width: 360px; display: flex; align-items: center; gap: 8px; padding: 0 12px; border: 1px solid var(--line); border-radius: 9px; background: #121616; color: var(--muted); }
 .search-field input { width: 100%; padding: 10px 0; border: 0; outline: 0; color: var(--text); background: transparent; font-size: 13px; }
 .activity-panel { padding: 4px 20px; }
+.activity-load-more { display: flex; align-items: center; justify-content: center; gap: 14px; padding: 18px 0 22px; color: var(--muted); font-size: 12px; }
 .profile-layout { display: grid; grid-template-columns: minmax(250px, 340px) 1fr; gap: 14px; }
 .profile-summary { position: sticky; top: 28px; align-self: start; padding: 24px; border: 1px solid rgba(183,255,60,.15); border-radius: 15px; background: radial-gradient(circle at 20% 0, rgba(183,255,60,.1), transparent 46%), var(--panel); }
 .profile-avatar { width: 52px; height: 52px; display: grid; place-items: center; margin-bottom: 30px; color: var(--accent); background: rgba(183,255,60,.08); border-radius: 15px; }

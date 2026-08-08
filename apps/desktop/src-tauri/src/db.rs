@@ -201,40 +201,22 @@ impl Database {
 
     pub fn insert_event(&self, event: &ActivityEvent, fingerprint: &str) -> AppResult<bool> {
         let conn = self.conn();
-        let existed: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM activity_events WHERE fingerprint=?1)",
-            [fingerprint],
-            |row| row.get(0),
-        )?;
-        conn.execute(
-            "INSERT INTO activity_events
-             (occurred_at,ended_at,duration_seconds,app_name,window_title,url,page_title,
-              search_query,browser_profile_id,source,is_bootstrap,fingerprint)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
-             ON CONFLICT(fingerprint) DO UPDATE SET
-               ended_at=excluded.ended_at,
-               duration_seconds=CASE
-                 WHEN excluded.source='chrome_history' THEN excluded.duration_seconds
-                 ELSE MAX(activity_events.duration_seconds,excluded.duration_seconds)
-               END,
-               page_title=COALESCE(excluded.page_title,activity_events.page_title),
-               search_query=COALESCE(excluded.search_query,activity_events.search_query)",
-            params![
-                event.occurred_at,
-                event.ended_at,
-                event.duration_seconds.max(0),
-                event.app_name,
-                event.window_title,
-                event.url,
-                event.page_title,
-                event.search_query,
-                event.browser_profile_id,
-                event.source.as_str(),
-                event.is_bootstrap,
-                fingerprint
-            ],
-        )?;
-        Ok(!existed)
+        upsert_event(&conn, event, fingerprint)
+    }
+
+    pub fn insert_events(&self, events: &[(ActivityEvent, String)]) -> AppResult<usize> {
+        if events.is_empty() {
+            return Ok(0);
+        }
+
+        let mut conn = self.conn();
+        let transaction = conn.transaction()?;
+        let mut inserted = 0;
+        for (event, fingerprint) in events {
+            inserted += upsert_event(&transaction, event, fingerprint)? as usize;
+        }
+        transaction.commit()?;
+        Ok(inserted)
     }
 
     pub fn history(&self, request: &HistoryRequest) -> AppResult<Vec<ActivityEvent>> {
@@ -932,6 +914,43 @@ impl Database {
         tx.commit()?;
         Ok(())
     }
+}
+
+fn upsert_event(conn: &Connection, event: &ActivityEvent, fingerprint: &str) -> AppResult<bool> {
+    let existed: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM activity_events WHERE fingerprint=?1)",
+        [fingerprint],
+        |row| row.get(0),
+    )?;
+    conn.execute(
+        "INSERT INTO activity_events
+         (occurred_at,ended_at,duration_seconds,app_name,window_title,url,page_title,
+          search_query,browser_profile_id,source,is_bootstrap,fingerprint)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
+         ON CONFLICT(fingerprint) DO UPDATE SET
+           ended_at=excluded.ended_at,
+           duration_seconds=CASE
+             WHEN excluded.source='chrome_history' THEN excluded.duration_seconds
+             ELSE MAX(activity_events.duration_seconds,excluded.duration_seconds)
+           END,
+           page_title=COALESCE(excluded.page_title,activity_events.page_title),
+           search_query=COALESCE(excluded.search_query,activity_events.search_query)",
+        params![
+            event.occurred_at,
+            event.ended_at,
+            event.duration_seconds.max(0),
+            event.app_name,
+            event.window_title,
+            event.url,
+            event.page_title,
+            event.search_query,
+            event.browser_profile_id,
+            event.source.as_str(),
+            event.is_bootstrap,
+            fingerprint
+        ],
+    )?;
+    Ok(!existed)
 }
 
 fn map_activity(row: &rusqlite::Row<'_>) -> rusqlite::Result<ActivityEvent> {

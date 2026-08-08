@@ -150,7 +150,7 @@ fn import_chrome_history(
             ))
         })?;
         let now = Utc::now().timestamp();
-        let mut count = 0;
+        let mut events = Vec::new();
         for row in rows {
             let (url, title, chrome_time, chrome_duration) = row?;
             let occurred_at = chrome_time / 1_000_000 - 11_644_473_600;
@@ -178,11 +178,10 @@ fn import_chrome_history(
                 source: ActivitySource::ChromeHistory,
                 is_bootstrap: occurred_at < now - 30 * 86_400,
             };
-            if db.insert_event(&event, &fingerprint(&event))? {
-                count += 1;
-            }
+            let event_fingerprint = fingerprint(&event);
+            events.push((event, event_fingerprint));
         }
-        Ok(count)
+        db.insert_events(&events)
     })();
     let cleanup = fs::remove_file(temporary);
     match (result, cleanup) {

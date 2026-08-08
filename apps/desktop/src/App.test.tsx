@@ -367,6 +367,28 @@ describe("dashboard", () => {
 describe("editor file changes", () => {
   beforeEach(stubApi);
 
+  it("renders a large timeline incrementally without discarding stored events", async () => {
+    const events = Array.from({ length: 150 }, (_, index): ActivityEvent => ({
+      id: `event-${index}`,
+      appName: "Terminal",
+      windowTitle: `Command ${index}`,
+      startedAt: new Date(1_700_000_000_000 - index * 1_000).toISOString(),
+      durationSeconds: 5,
+      source: "collector",
+    }));
+    vi.mocked(api.activity).mockResolvedValue(events);
+
+    await renderRoute("#/activity");
+
+    expect(await screen.findByText("Showing 100 of 150 events")).toBeInTheDocument();
+    expect(document.querySelectorAll(".activity-row")).toHaveLength(100);
+
+    fireEvent.click(screen.getByRole("button", { name: "Show more" }));
+
+    expect(document.querySelectorAll(".activity-row")).toHaveLength(150);
+    expect(screen.queryByRole("button", { name: "Show more" })).not.toBeInTheDocument();
+  });
+
   it("shows recent workspace changes when Code activity has no window metadata", async () => {
     vi.mocked(api.activity).mockResolvedValue([{
       id: "code-without-title",

@@ -58,6 +58,7 @@ const navigation = [
 ];
 
 const providers: Provider[] = ["openai", "anthropic", "bedrock"];
+const ACTIVITY_PAGE_SIZE = 100;
 
 function providerLabel(provider: Provider): string {
   if (provider === "openai") return "OpenAI";
@@ -865,11 +866,15 @@ function ThreadsPage() {
 function ActivityPage() {
   const [range, setRange] = useState<RangeKey>("today");
   const [query, setQuery] = useState("");
+  const [visibleCount, setVisibleCount] = useState(ACTIVITY_PAGE_SIZE);
   const resource = useResource(() => api.activity(range, query), [range]);
   const filtered = useMemo(
     () => resource.data?.filter((event) => `${event.appName} ${event.windowTitle} ${event.pageTitle} ${event.searchQuery} ${event.topic}`.toLowerCase().includes(query.toLowerCase())),
     [resource.data, query],
   );
+  useEffect(() => setVisibleCount(ACTIVITY_PAGE_SIZE), [range, query]);
+  const visibleEvents = filtered?.slice(0, visibleCount) ?? [];
+  const hasMore = visibleEvents.length < (filtered?.length ?? 0);
   return (
     <div className="page">
       <PageHeader
@@ -885,7 +890,19 @@ function ActivityPage() {
       <section className="panel activity-panel">
         <EditorChangeSummary events={filtered ?? []} />
         <ResourceState {...resource}>
-          {() => <ActivityList events={filtered ?? []} />}
+          {() => (
+            <>
+              <ActivityList events={visibleEvents} />
+              {hasMore && (
+                <div className="activity-load-more">
+                  <span>Showing {visibleEvents.length} of {filtered?.length ?? 0} events</span>
+                  <button className="ghost-button" onClick={() => setVisibleCount((count) => count + ACTIVITY_PAGE_SIZE)}>
+                    Show more
+                  </button>
+                </div>
+              )}
+            </>
+          )}
         </ResourceState>
       </section>
     </div>

@@ -226,6 +226,26 @@ fn inherit_browser_context(
     assignments: &mut HashMap<i64, String>,
 ) {
     let direct_assignments = assignments.clone();
+    let mut direct_by_browser = HashMap::<(String, String), Vec<(i64, String)>>::new();
+    for candidate in events {
+        let Some(topic) = candidate
+            .id
+            .and_then(|candidate_id| direct_assignments.get(&candidate_id))
+        else {
+            continue;
+        };
+        let Some(profile_id) = candidate.browser_profile_id.as_ref() else {
+            continue;
+        };
+        direct_by_browser
+            .entry((candidate.app_name.to_ascii_lowercase(), profile_id.clone()))
+            .or_default()
+            .push((candidate.occurred_at, topic.clone()));
+    }
+    for candidates in direct_by_browser.values_mut() {
+        candidates.sort_unstable_by_key(|(occurred_at, _)| *occurred_at);
+    }
+
     for (event, (event_id, tokens)) in events.iter().zip(event_tokens) {
         let Some(event_id) = *event_id else {
             continue;
@@ -236,19 +256,24 @@ fn inherit_browser_context(
         {
             continue;
         }
-
-        let nearby_topics = events
+        let Some(profile_id) = event.browser_profile_id.as_ref() else {
+            continue;
+        };
+        let key = (event.app_name.to_ascii_lowercase(), profile_id.clone());
+        let Some(candidates) = direct_by_browser.get(&key) else {
+            continue;
+        };
+        let window_start = event
+            .occurred_at
+            .saturating_sub(BROWSER_CONTEXT_WINDOW_SECONDS);
+        let window_end = event
+            .occurred_at
+            .saturating_add(BROWSER_CONTEXT_WINDOW_SECONDS);
+        let first = candidates.partition_point(|(occurred_at, _)| *occurred_at < window_start);
+        let nearby_topics = candidates[first..]
             .iter()
-            .filter(|candidate| {
-                candidate.occurred_at.abs_diff(event.occurred_at)
-                    <= BROWSER_CONTEXT_WINDOW_SECONDS as u64
-                    && same_browser_context(event, candidate)
-            })
-            .filter_map(|candidate| {
-                candidate
-                    .id
-                    .and_then(|candidate_id| direct_assignments.get(&candidate_id))
-            })
+            .take_while(|(occurred_at, _)| *occurred_at <= window_end)
+            .map(|(_, topic)| topic)
             .collect::<HashSet<_>>();
         if nearby_topics.len() == 1 {
             assignments.insert(
@@ -261,16 +286,6 @@ fn inherit_browser_context(
             );
         }
     }
-}
-
-fn same_browser_context(left: &ActivityEvent, right: &ActivityEvent) -> bool {
-    if !left.app_name.eq_ignore_ascii_case(&right.app_name) {
-        return false;
-    }
-    matches!(
-        (&left.browser_profile_id, &right.browser_profile_id),
-        (Some(left), Some(right)) if left == right
-    )
 }
 
 fn is_navigation_platform(event: &ActivityEvent) -> bool {
